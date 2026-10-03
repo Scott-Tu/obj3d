@@ -20,8 +20,8 @@
 
 1. 到 https://www.kaggle.com 註冊並登入。
 2. 右上角頭像 → **Settings** → 完成 **Phone verification（手機驗證）**。沒驗證就不能用 GPU 和網路。
-3. 同一頁往下到 **API** → 按 **Create New Token**，把產生的金鑰（`KGAT_` 開頭）複製下來，稍後貼到 App 裡。
-   - 如果你用的是舊版的 `kaggle.json`，裡面的 `key` 也可以用。
+3. 打開 https://www.kaggle.com/settings ，在 **API** 區塊按 **Generate New Token**，把產生的金鑰（`KGAT_` 開頭）複製下來，稍後貼到 App 裡。
+   - 也可以按 **Create Legacy API Key** 下載舊版 `kaggle.json`，裡面的 `key` 一樣可以用。
 4. 記下你的 Kaggle **使用者名稱（username）**，在個人頁網址 `kaggle.com/你的名稱` 可以看到。
 
 ## 二、在 GitHub 編譯出 App 安裝檔（只有 Windows 也可以）
@@ -42,12 +42,12 @@ iOS App 必須在 Mac 上編譯，這裡借用 GitHub 免費提供的雲端 Mac�
 ## 三、安裝到 iPhone（用 Windows + Sideloadly）
 
 1. 在 Windows 安裝：
-   - **iTunes**（建議從 Apple 官網下載的版本，而不是 Microsoft Store 版）
+   - **iTunes、iCloud**：一定要用 Apple 官網下載的版本。如果電腦裡已經有 Microsoft Store 版，請先解除安裝。
    - **Sideloadly**（https://sideloadly.io）
 2. 用 USB 線連接 iPhone，iPhone 上按「信任這部電腦」。
 3. 打開 Sideloadly：
    - 把 `Obj3D.ipa` 拖進視窗
-   - **Apple account** 填你的 Apple ID（建議另外註冊一個測試用的 Apple ID）
+   - **Apple account** 填你的 Apple ID（建議另外註冊一個測試用的 Apple ID；全新的 Apple ID 要先在任一台 Apple 裝置上登入過一次，否則可能無法使用）
    - 按 **Start**，依指示輸入密碼與雙重驗證碼
 4. iPhone 上第一次要做兩件事：
    - **設定 → 隱私權與安全性 → 開發者模式** → 開啟 → 重新開機 → 開機後按「開啟」確認

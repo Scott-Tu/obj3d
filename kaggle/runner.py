@@ -18,6 +18,7 @@ CONF_DROP_PERCENT = 40
 HR_TOL = 0.04
 MASK_ERODE_PX = 4
 MAX_FRAMES = 0          # 0 = 依 GPU 記憶體自動決定
+MAX_FACES_BEFORE_FIX = 300_000   # 補洞（單核心）前先精簡網格
 
 
 def log(*a):
@@ -600,7 +601,10 @@ def build_mesh(Pc_b, COL_b, FID_b, Pc_g, COL_g, Cc, U, has_table):
     mesh_o = poisson_mesh(pcd_p, POISSON_DEPTH, 0.02, np.array([lo[0], lo[1], -SINK]), hi, keep_largest=True)
     if SMOOTH_ITERS > 0:
         mesh_o = mesh_o.filter_smooth_taubin(number_of_iterations=SMOOTH_ITERS)
-    log("Poisson 完成，開始補洞")
+    log(f"Poisson 完成：{len(mesh_o.triangles):,} 面")
+    if len(mesh_o.triangles) > MAX_FACES_BEFORE_FIX:
+        mesh_o = mesh_o.simplify_quadric_decimation(MAX_FACES_BEFORE_FIX)
+        log(f"精簡為 {len(mesh_o.triangles):,} 面，開始補洞")
     mf = pymeshfix.MeshFix(np.asarray(mesh_o.vertices), np.asarray(mesh_o.triangles))
     mf.repair(joincomp=True, remove_smallest_components=True)
     Vb, Fb = mf.points, mf.faces
