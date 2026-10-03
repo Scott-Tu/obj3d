@@ -1,0 +1,49 @@
+name: Build iOS App
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "ios/**"
+      - "kaggle/**"
+      - ".github/workflows/**"
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安裝 XcodeGen
+        run: brew install xcodegen
+
+      - name: 產生 Xcode 專案
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: 編譯（不簽名，之後由 Sideloadly 簽名）
+        working-directory: ios
+        run: |
+          set -o pipefail
+          xcodebuild -version
+          xcodebuild -project Obj3D.xcodeproj -target Obj3D -configuration Release -sdk iphoneos \
+            SYMROOT="$PWD/build" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee build.log | tail -n 40
+
+      - name: 打包 IPA
+        run: |
+          mkdir -p Payload
+          cp -R ios/build/Release-iphoneos/Obj3D.app Payload/
+          zip -qry Obj3D.ipa Payload
+          ls -lh Obj3D.ipa
+
+      - name: 上傳 IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Obj3D-ipa
+          path: Obj3D.ipa
+
+      - name: 列出編譯錯誤（失敗時才執行）
+        if: failure()
+        run: grep -n "error:" ios/build.log | head -60 || true
