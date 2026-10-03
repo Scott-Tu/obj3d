@@ -23,10 +23,26 @@ struct KaggleClient {
         return KaggleClient(username: user, key: key)
     }
 
-    /// 新版 API Token（KGAT_ 開頭）用 Bearer；舊版 kaggle.json 的 key 用 Basic
-    private var authorization: String {
-        if key.hasPrefix("KGAT_") { return "Bearer \(key)" }
+    private static let modeKey = "kaggleAuthMode"
+
+    /// 新版 API Token 用 Bearer；舊版 kaggle.json 的 key 用 Basic。
+    /// 先試比較可能的方式，遇到 401/403 自動改用另一種，成功後記住。
+    private var authModes: [String] {
+        if let saved = UserDefaults.standard.string(forKey: KaggleClient.modeKey) {
+            return saved == "bearer" ? ["bearer", "basic"] : ["basic", "bearer"]
+        }
+        return key.hasPrefix("KGAT_") ? ["bearer", "basic"] : ["basic", "bearer"]
+    }
+
+    private func header(_ mode: String) -> String {
+        if mode == "bearer" { return "Bearer \(key)" }
         return "Basic " + Data("\(username):\(key)".utf8).base64EncodedString()
+    }
+
+    private var authorization: String { header(authModes[0]) }
+
+    static func resetAuthMode() {
+        UserDefaults.standard.removeObject(forKey: modeKey)
     }
 
     @discardableResult
@@ -34,29 +50,40 @@ struct KaggleClient {
         guard let url = URL(string: "https://api.kaggle.com/v1/\(service)/\(method)") else {
             throw KaggleError(message: "網址錯誤")
         }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.timeoutInterval = 120
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue(authorization, forHTTPHeaderField: "Authorization")
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-        let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-        let text = String(data: data, encoding: .utf8) ?? ""
-        if code == 401 || code == 403 {
-            throw KaggleError(message: "Kaggle 驗證失敗（\(code)）：請檢查設定裡的使用者名稱與 API 金鑰。\(method)")
+        let payload = try JSONSerialization.data(withJSONObject: body)
+        let modes = authModes
+        for (i, mode) in modes.enumerated() {
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.timeoutInterval = 120
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue("kaggle-api/v1.7.0", forHTTPHeaderField: "User-Agent")
+            req.setValue(header(mode), forHTTPHeaderField: "Authorization")
+            req.httpBody = payload
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+            let text = String(data: data, encoding: .utf8) ?? ""
+            if code == 401 || code == 403 {
+                if i < modes.count - 1 { continue }          // 換另一種驗證方式再試一次
+                let detail = (obj["message"] as? String) ?? String(text.prefix(200))
+                throw KaggleError(message: "Kaggle 驗證失敗（\(code)）：\(method)。請到「設定」按「測試 Kaggle 連線」檢查使用者名稱與金鑰。\(detail)")
+            }
+            if code > 0 && code < 400 {
+                UserDefaults.standard.set(mode, forKey: KaggleClient.modeKey)
+            }
+            if code >= 400 {
+                throw KaggleError(message: "Kaggle \(method) 失敗（\(code)）：\((obj["message"] as? String) ?? String(text.prefix(300)))")
+            }
+            if let c = obj["code"] as? Int, c >= 400 {
+                throw KaggleError(message: "Kaggle \(method) 失敗（\(c)）：\(obj["message"] as? String ?? "")")
+            }
+            if let e = obj["error"] as? String, !e.isEmpty {
+                throw KaggleError(message: "Kaggle \(method) 錯誤：\(e)")
+            }
+            return obj
         }
-        if code >= 400 {
-            throw KaggleError(message: "Kaggle \(method) 失敗（\(code)）：\((obj["message"] as? String) ?? String(text.prefix(300)))")
-        }
-        if let c = obj["code"] as? Int, c >= 400 {
-            throw KaggleError(message: "Kaggle \(method) 失敗（\(c)）：\(obj["message"] as? String ?? "")")
-        }
-        if let e = obj["error"] as? String, !e.isEmpty {
-            throw KaggleError(message: "Kaggle \(method) 錯誤：\(e)")
-        }
-        return obj
+        throw KaggleError(message: "Kaggle \(method) 沒有回應")
     }
 
     // MARK: - 上傳檔案並建立資料集版本
