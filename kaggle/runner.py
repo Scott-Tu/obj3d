@@ -18,7 +18,7 @@ CONF_DROP_PERCENT = 40
 HR_TOL = 0.04
 MASK_ERODE_PX = 4
 MAX_FRAMES = 0          # 0 = 依 GPU 記憶體自動決定
-MAX_FACES_BEFORE_FIX = 300_000   # 補洞（單核心）前先精簡網格
+SOLID_VOXEL = 0.06      # 封閉實體的體素大小（cm，以 12 cm 物體為基準，會依物體大小縮放）
 
 
 def log(*a):
@@ -39,7 +39,7 @@ def sh(cmd):
 
 
 def install():
-    sh("pip -q install open3d trimesh pymeshfix manifold3d einops safetensors huggingface_hub")
+    sh("pip -q install open3d trimesh scikit-image einops safetensors huggingface_hub")
     sh("SAM2_BUILD_CUDA=0 pip -q install git+https://github.com/facebookresearch/sam2.git")
     if not os.path.isdir("/tmp/vggt"):
         sh("git clone -q --depth 1 https://github.com/facebookresearch/vggt /tmp/vggt")
@@ -205,12 +205,17 @@ def orient_normals_by_source_cam(pcd, src_pts, src_cam_centers):
     return pcd
 
 
-def poisson_mesh(pcd, depth, trim_q, bbox_min, bbox_max, keep_largest=False):
-    mesh, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=depth, scale=1.1, linear_fit=False)
-    dens = np.asarray(dens)
-    if trim_q > 0:
+def poisson_mesh(pcd, depth, trim_q, bbox_min, bbox_max, keep_largest=False, max_dist=None, scale=1.1, crop=True):
+    """Poisson 重建。max_dist：只刪掉離資料點超過這個距離的曲面（比用密度修剪更不容易開出大洞）"""
+    mesh, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=depth, scale=scale, linear_fit=False)
+    if max_dist is not None:
+        d = cKDTree(np.asarray(pcd.points)).query(np.asarray(mesh.vertices), k=1)[0]
+        mesh.remove_vertices_by_mask(d > max_dist)
+    elif trim_q > 0:
+        dens = np.asarray(dens)
         mesh.remove_vertices_by_mask(dens < np.quantile(dens, trim_q))
-    mesh = mesh.crop(o3d.geometry.AxisAlignedBoundingBox(bbox_min, bbox_max))
+    if crop:
+        mesh = mesh.crop(o3d.geometry.AxisAlignedBoundingBox(bbox_min, bbox_max))
     tri_clusters, counts, _ = mesh.cluster_connected_triangles()
     tri_clusters = np.asarray(tri_clusters); counts = np.asarray(counts)
     if len(counts):
@@ -276,9 +281,70 @@ def color_from_frames(mesh, vidx, frame_paths, masks, intrinsic, Rcam, Ra, Cc, s
     out = np.array(fallback, dtype=np.float64)
     has = ws > 0
     out[has] = (best_c[has] * best_w[has, :, None]).sum(1) / ws[has, None]
-    print(f"影像取色：{has.mean():.1%} 的物體頂點有可見視角")
+    print(f"影片取色：{has.mean():.1%} 的小熊頂點有可見視角")
     return out
 
+
+def voxel_solid(mesh, vox, close_iters=2, base=None, sink=0.15, min_comp=0.05, max_voxels=40e6, clip_lo=None, clip_hi=None):
+    """把表面網格轉成「保證封閉」的實體：
+    1) 整個網格體素化並填滿內部（Poisson 未修剪的網格本身就是封閉的，填得起來）
+    2) 用體積的方式裁掉資料範圍外的部分與桌面以下（裁切後仍是實心，不會開洞）
+    3) 加上實心底座，Marching Cubes 轉回表面。base = (中心 xy, 半徑, 厚度) 或 None"""
+    from scipy import ndimage
+    from skimage import measure
+    lo = np.asarray(mesh.get_min_bound(), float).copy(); hi = np.asarray(mesh.get_max_bound(), float).copy()
+    if base is not None:
+        cxy, R, T = base
+        lo = np.minimum(lo, [cxy[0] - R, cxy[1] - R, -T]); hi = np.maximum(hi, [cxy[0] + R, cxy[1] + R, 0.0])
+    vox = max(vox, (np.prod(hi - lo) / max_voxels) ** (1 / 3))
+    pad = close_iters + 3
+    lo = lo - pad * vox
+    shape = np.ceil((hi - lo) / vox).astype(int) + pad + 1
+    n = int(np.clip(mesh.get_surface_area() / (vox * 0.5) ** 2, 2e5, 1.5e7))
+    P = np.asarray(mesh.sample_points_uniformly(n).points)
+    idx = np.clip(np.floor((P - lo) / vox).astype(int), 0, shape - 1)
+    occ = np.zeros(shape, bool)
+    occ[idx[:, 0], idx[:, 1], idx[:, 2]] = True
+    st = ndimage.generate_binary_structure(3, 1)
+    occ = ndimage.binary_dilation(occ, structure=st, iterations=1)
+    if close_iters > 0:
+        occ = ndimage.binary_closing(occ, structure=st, iterations=close_iters)
+    occ = ndimage.binary_fill_holes(occ)
+    occ = ndimage.binary_erosion(occ, structure=st, iterations=1)
+    xc = lo[0] + (np.arange(shape[0]) + 0.5) * vox
+    yc = lo[1] + (np.arange(shape[1]) + 0.5) * vox
+    zc = lo[2] + (np.arange(shape[2]) + 0.5) * vox
+    if clip_lo is not None:                                    # 體積裁切：資料範圍外的 Poisson 外插部分
+        occ &= ((xc >= clip_lo[0]) & (xc <= clip_hi[0]))[:, None, None]
+        occ &= ((yc >= clip_lo[1]) & (yc <= clip_hi[1]))[None, :, None]
+        occ &= (zc <= clip_hi[2])[None, None, :]
+    occ[:, :, zc < -sink] = False
+    if base is not None:
+        disk = ((xc[:, None] - cxy[0]) ** 2 + (yc[None, :] - cxy[1]) ** 2) <= R * R
+        zsel = (zc >= -T) & (zc <= 0)
+        occ[:, :, zc < 0] = False
+        occ[:, :, zsel] |= disk[:, :, None]
+    else:
+        occ[:, :, zc < 0] = False
+    lab, nlab = ndimage.label(occ)
+    if nlab > 1:
+        sizes = ndimage.sum(occ, lab, range(1, nlab + 1))
+        occ = np.isin(lab, 1 + np.nonzero(sizes >= min_comp * sizes.max())[0])
+    field = ndimage.gaussian_filter(np.pad(occ, 2).astype(np.float32), 0.8)   # 平滑後的等值面不會有非流形邊
+    v, f, _, _ = measure.marching_cubes(field, level=0.5)
+    V = lo + (v - 2 + 0.5) * vox
+    m = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(V), o3d.utility.Vector3iVector(f.astype(np.int32)))
+    m.remove_duplicated_vertices(); m.remove_degenerate_triangles()
+    tc, cnt, _ = m.cluster_connected_triangles()
+    tc = np.asarray(tc); cnt = np.asarray(cnt)
+    if len(cnt) > 1:
+        m.remove_triangles_by_mask(~(cnt >= 0.01 * cnt.max())[tc]); m.remove_unreferenced_vertices()
+    import trimesh
+    if trimesh.Trimesh(np.asarray(m.vertices), np.asarray(m.triangles), process=False).volume < 0:
+        m.triangles = o3d.utility.Vector3iVector(np.asarray(m.triangles)[:, ::-1])
+    m = m.filter_smooth_taubin(number_of_iterations=5)
+    m.compute_vertex_normals()
+    return m, vox
 
 
 # =====================================================================
@@ -546,8 +612,8 @@ def main():
     del P_obj0, P_bg0
 
     # ---- 6. 網格 ----
-    mesh, bp, info = build_mesh(Pc_b, COL_obj, FID_obj, Pc_g, COL_bg, Cc, U, has_table)
-    is_obj = np.asarray(mesh.vertices)[:, 2] > 0.01 * U
+    mesh, bp, info, vox = build_mesh(Pc_b, COL_obj, FID_obj, Pc_g, COL_bg, Cc, U, has_table)
+    is_obj = np.asarray(mesh.vertices)[:, 2] > 1.5 * vox
     cols = np.asarray(mesh.vertex_colors).copy()
     cols[is_obj] = color_from_frames(mesh, np.nonzero(is_obj)[0], frame_paths, MASKS, intrinsic, Rcam, A,
                                      Cc, sx, sy, padL, padT, sc[pick], cols[is_obj])
@@ -563,7 +629,6 @@ def main():
 
 
 def build_mesh(Pc_b, COL_b, FID_b, Pc_g, COL_g, Cc, U, has_table):
-    import pymeshfix, manifold3d as m3d
     T_BASE = max(0.5 * U, 0.2)
     SINK = min(0.15 * U, T_BASE / 2)
     VOX = max(0.05, 0.05 * U)
@@ -588,67 +653,50 @@ def build_mesh(Pc_b, COL_b, FID_b, Pc_g, COL_g, Cc, U, has_table):
 
     zmin = bp[:, 2].min()
     fm = bp[:, 2] < zmin + 0.6 * U
-    foot = bp[fm]
     levels = np.arange(zmin, -0.45 * U, -0.2 * U)
-    foot_pts = np.vstack([np.c_[foot[:, :2], np.full(len(foot), z_)] for z_ in levels]) if len(levels) else np.zeros((0, 3))
+    foot_pts = np.vstack([np.c_[bp[fm][:, :2], np.full(fm.sum(), z_)] for z_ in levels]) if len(levels) else np.zeros((0, 3))
     nb_ = np.asarray(pcd.normals)[fm].copy(); nb_[:, 2] = 0
     ln_ = np.linalg.norm(nb_, axis=1, keepdims=True)
     nb_ = np.where(ln_ > 0.2, nb_ / np.maximum(ln_, 1e-9), [0, 0, -1.0])
     pcd_p = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.vstack([bp, foot_pts])))
     pcd_p.normals = o3d.utility.Vector3dVector(np.vstack([np.asarray(pcd.normals), np.tile(nb_, (len(levels), 1))]))
 
-    lo, hi = bp.min(0) - 0.5 * U, bp.max(0) + 0.5 * U
-    mesh_o = poisson_mesh(pcd_p, POISSON_DEPTH, 0.02, np.array([lo[0], lo[1], -SINK]), hi, keep_largest=True)
-    if SMOOTH_ITERS > 0:
-        mesh_o = mesh_o.filter_smooth_taubin(number_of_iterations=SMOOTH_ITERS)
-    log(f"Poisson 完成：{len(mesh_o.triangles):,} 面")
-    if len(mesh_o.triangles) > MAX_FACES_BEFORE_FIX:
-        mesh_o = mesh_o.simplify_quadric_decimation(MAX_FACES_BEFORE_FIX)
-        log(f"精簡為 {len(mesh_o.triangles):,} 面，開始補洞")
-    mf = pymeshfix.MeshFix(np.asarray(mesh_o.vertices), np.asarray(mesh_o.triangles))
-    mf.repair(joincomp=True, remove_smallest_components=True)
-    Vb, Fb = mf.points, mf.faces
-    log("補洞完成")
+    pm = poisson_mesh(pcd_p, POISSON_DEPTH, 0, None, None, scale=1.5, crop=False)
+    log(f"Poisson 完成：{len(pm.triangles):,} 面")
 
     bpx = bp[:, :2]
     cxy = (bpx.min(0) + bpx.max(0)) / 2
     R_base = np.linalg.norm(bpx - cxy, axis=1).max() + max(1.0, 0.15 * np.ptp(bpx, axis=0).max())
     tm = (np.abs(Pc_g[:, 2]) < 0.3 * U) & (np.linalg.norm(Pc_g[:, :2] - cxy, axis=1) < R_base + 2 * U)
-    to_m = lambda V, F: m3d.Manifold(m3d.Mesh(vert_properties=np.asarray(V, np.float32), tri_verts=np.asarray(F, np.uint32)))
-    obj_m = to_m(Vb, Fb)
     use_base = has_table and tm.sum() > 200
-    if use_base:
-        base = make_base(cxy, R_base, "circle", T_BASE, Pc_g[tm], COL_g[tm])
-        base_m = to_m(base.vertices, base.triangles)
-    if obj_m.status() == m3d.Error.NoError and (not use_base or base_m.status() == m3d.Error.NoError):
-        solid = obj_m + base_m if use_base else obj_m.trim_by_plane((0, 0, 1), 0.0)
-        out = solid.to_mesh()
-        V3 = np.array(out.vert_properties)[:, :3].astype(np.float64)
-        F3 = np.array(out.tri_verts).astype(np.int32)
-    else:
-        WARN.append("布林運算失敗，模型由兩個各自封閉的部分組成")
-        V3, F3 = np.asarray(Vb, float), np.asarray(Fb, np.int32)
-        if use_base:
-            V3 = np.vstack([V3, np.asarray(base.vertices)]); F3 = np.vstack([F3, np.asarray(base.triangles) + len(Vb)])
-    mesh = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(V3), o3d.utility.Vector3iVector(F3))
-    mesh.compute_vertex_normals()
+    margin = 0.3 * U
+    mesh, vox = voxel_solid(pm, SOLID_VOXEL * U, base=(cxy, R_base, T_BASE) if use_base else None, sink=SINK,
+                            clip_lo=bp.min(0) - margin, clip_hi=bp.max(0) + margin)
+    if SMOOTH_ITERS > 0:
+        mesh = mesh.filter_smooth_taubin(number_of_iterations=SMOOTH_ITERS)
+        mesh.compute_vertex_normals()
+    V3 = np.asarray(mesh.vertices); F3 = np.asarray(mesh.triangles)
+    log(f"封閉實體完成：{len(F3):,} 面（體素 {vox*10:.2f} mm）")
 
     cols = np.zeros((len(V3), 3))
-    is_obj = V3[:, 2] > 0.01 * U
+    is_obj = V3[:, 2] > 1.5 * vox
     if use_base:
-        top = ~is_obj & (np.abs(V3[:, 2]) < 0.01 * U)
+        top = ~is_obj & (V3[:, 2] > -0.75 * vox)
         _, ti = cKDTree(Pc_g[tm][:, :2]).query(V3[top][:, :2], k=8)
         cols[top] = COL_g[tm][ti].mean(1)
         cols[~is_obj & ~top] = np.median(COL_g[tm], 0) * 0.85
+    else:
+        cols[~is_obj] = 0.7
     _, fb = cKDTree(bp).query(V3[is_obj], k=4)
     cols[is_obj] = np.asarray(pcd.colors)[fb].mean(1)
     mesh.vertex_colors = o3d.utility.Vector3dVector(np.clip(cols, 0, 1))
 
     import trimesh
     wt = trimesh.Trimesh(V3, F3, process=False)
-    info = dict(watertight=bool(wt.is_watertight), volume_cm3=round(float(abs(wt.volume)), 1) if wt.is_watertight else None,
-                triangles=int(len(F3)), has_base=bool(use_base))
-    return mesh, bp, info
+    info = dict(watertight=bool(wt.is_watertight), bodies=int(wt.body_count),
+                volume_cm3=round(float(abs(wt.volume)), 1) if wt.is_watertight else None,
+                triangles=int(len(F3)), has_base=bool(use_base), solid_voxel_mm=round(vox * 10, 2))
+    return mesh, bp, info, vox
 
 
 def export_all(mesh):
