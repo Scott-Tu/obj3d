@@ -69,6 +69,8 @@ struct SettingsView: View {
         let client = KaggleClient(username: u, key: k)
         func short(_ e: Error) -> String { String(e.localizedDescription.prefix(160)) }
 
+        lines.append(await KaggleClient.headerEchoTest())
+
         var tokenOK = false
         do {
             let r = try await client.call("security.OAuthService", "IntrospectToken", ["token": k])
@@ -112,7 +114,8 @@ struct SettingsView: View {
             lines.append("④ 運算程式：尚未建立或無法讀取（\(short(error))）")
         }
 
-        lines.append(tokenOK && uploadOK ? "✅ 驗證成功，可以開始生成（③④ 第一次使用時顯示「尚未建立」是正常的）"
+        lines.append("傳輸方式：\(KaggleClient.usesRawHTTP ? "直接連線（繞過 iOS 網路元件）" : "iOS 標準")")
+        lines.append(uploadOK ? "✅ 驗證成功，可以開始生成（③④ 第一次使用時顯示「尚未建立」是正常的；① 用舊版 key 時顯示 404 也正常）"
                                          : "❌ 驗證未通過，請把這段結果截圖給我")
         testResult = lines.joined(separator: "\n")
     }

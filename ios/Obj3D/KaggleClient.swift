@@ -65,8 +65,56 @@ struct KaggleClient {
 
     private var authorization: String { header(authModes[0]) }
 
+    /// 診斷用：把一個「假的」驗證標頭送到公開的回聲服務，看它有沒有真的被送出去
+    static func headerEchoTest() async -> String {
+        for (urlString, label) in [("https://httpbin.org/anything", "httpbin"), ("https://postman-echo.com/post", "postman-echo")] {
+            guard let url = URL(string: urlString) else { continue }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.timeoutInterval = 20
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue("Bearer obj3d-header-test", forHTTPHeaderField: "Authorization")
+            req.httpBody = Data("{}".utf8)
+            guard let result = try? await KaggleClient.apiSession.data(for: req),
+                  let obj = (try? JSONSerialization.jsonObject(with: result.0)) as? [String: Any],
+                  let headers = obj["headers"] as? [String: Any] else { continue }
+            let match = headers.first(where: { $0.key.lowercased() == "authorization" })
+            let auth = match?.value as? String
+            if auth == "Bearer obj3d-header-test" { return "⓪ 驗證標頭傳送：✅ 正常（\(label)）" }
+            return "⓪ 驗證標頭傳送：❌ 標頭沒有送出去或被改掉（\(label) 收到：\(auth ?? "無")）"
+        }
+        return "⓪ 驗證標頭傳送：無法測試（連不到測試網站）"
+    }
+
     static func resetAuthMode() {
         UserDefaults.standard.removeObject(forKey: modeKey)
+        UserDefaults.standard.removeObject(forKey: rawKey)
+    }
+
+    static let rawKey = "kaggleRawHTTP"
+    static var usesRawHTTP: Bool { UserDefaults.standard.bool(forKey: rawKey) }
+
+    /// 送出一次請求。raw = true 時不經過 URLSession，確保 Authorization 標頭一定送出。
+    private func send(_ url: URL, mode: String, payload: Data, raw: Bool) async throws -> (Int, Data, String) {
+        let headers = [
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "kaggle-api/v1.7.0",
+            "Authorization": header(mode),
+        ]
+        if raw {
+            let (code, data) = try await RawHTTP.post(url: url, headers: headers, body: payload)
+            return (code, data, "")
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 120
+        for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
+        req.httpBody = payload
+        let (data, resp) = try await KaggleClient.apiSession.data(for: req)
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        let finalURL = resp.url?.absoluteString ?? ""
+        return (code, data, finalURL == url.absoluteString ? "" : finalURL)
     }
 
     @discardableResult
@@ -75,41 +123,35 @@ struct KaggleClient {
             throw KaggleError(message: "網址錯誤")
         }
         let payload = try JSONSerialization.data(withJSONObject: body)
-        let modes = authModes
-        for (i, mode) in modes.enumerated() {
-            var req = URLRequest(url: url)
-            req.httpMethod = "POST"
-            req.timeoutInterval = 120
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.setValue("kaggle-api/v1.7.0", forHTTPHeaderField: "User-Agent")
-            req.setValue(header(mode), forHTTPHeaderField: "Authorization")
-            req.httpBody = payload
-            let (data, resp) = try await KaggleClient.apiSession.data(for: req)
-            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-            let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-            let text = String(data: data, encoding: .utf8) ?? ""
-            let finalURL = resp.url?.absoluteString ?? ""
-            let moved = finalURL.isEmpty || finalURL == url.absoluteString ? "" : "（轉址到 \(finalURL)）"
-            if code == 401 || code == 403 {
-                if i < modes.count - 1 { continue }          // 換另一種驗證方式再試一次
-                let detail = (obj["message"] as? String) ?? String(text.prefix(200))
-                throw KaggleError(message: "Kaggle 驗證失敗（\(code)）：\(method)\(moved)。請到「設定」按「測試 Kaggle 連線」檢查使用者名稱與金鑰。\(detail)")
+        let transports: [Bool] = KaggleClient.usesRawHTTP ? [true] : [false, true]
+        var lastAuthError = ""
+        for raw in transports {
+            for mode in authModes {
+                let (code, data, moved) = try await send(url, mode: mode, payload: payload, raw: raw)
+                let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+                let text = String(data: data, encoding: .utf8) ?? ""
+                if code == 401 || code == 403 {
+                    let detail = (obj["message"] as? String) ?? String(text.prefix(200))
+                    lastAuthError = "Kaggle 驗證失敗（\(code)）：\(method)\(moved.isEmpty ? "" : "（轉址到 \(moved)）")。\(detail)"
+                    continue                                  // 換另一種驗證方式／傳輸方式再試
+                }
+                if code > 0 && code < 400 {
+                    UserDefaults.standard.set(mode, forKey: KaggleClient.modeKey)
+                    if raw { UserDefaults.standard.set(true, forKey: KaggleClient.rawKey) }
+                }
+                if code >= 400 {
+                    throw KaggleError(message: "Kaggle \(method) 失敗（\(code)）：\((obj["message"] as? String) ?? String(text.prefix(300)))")
+                }
+                if let c = obj["code"] as? Int, c >= 400 {
+                    throw KaggleError(message: "Kaggle \(method) 失敗（\(c)）：\(obj["message"] as? String ?? "")")
+                }
+                if let e = obj["error"] as? String, !e.isEmpty {
+                    throw KaggleError(message: "Kaggle \(method) 錯誤：\(e)")
+                }
+                return obj
             }
-            if code > 0 && code < 400 {
-                UserDefaults.standard.set(mode, forKey: KaggleClient.modeKey)
-            }
-            if code >= 400 {
-                throw KaggleError(message: "Kaggle \(method) 失敗（\(code)）：\((obj["message"] as? String) ?? String(text.prefix(300)))")
-            }
-            if let c = obj["code"] as? Int, c >= 400 {
-                throw KaggleError(message: "Kaggle \(method) 失敗（\(c)）：\(obj["message"] as? String ?? "")")
-            }
-            if let e = obj["error"] as? String, !e.isEmpty {
-                throw KaggleError(message: "Kaggle \(method) 錯誤：\(e)")
-            }
-            return obj
         }
-        throw KaggleError(message: "Kaggle \(method) 沒有回應")
+        throw KaggleError(message: lastAuthError.isEmpty ? "Kaggle \(method) 沒有回應" : lastAuthError)
     }
 
     // MARK: - 上傳檔案並建立資料集版本
