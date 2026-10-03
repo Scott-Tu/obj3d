@@ -10,7 +10,7 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Section(header: Text("Kaggle 帳號"),
-                    footer: Text("使用者名稱是 kaggle.com/ 後面那段（全小寫），不是顯示名稱。金鑰在 kaggle.com/settings → API → Generate New Token。金鑰只存在這支 iPhone 的鑰匙圈裡。")) {
+                    footer: Text("使用者名稱是 kaggle.com/ 後面那段（全小寫），不是顯示名稱。金鑰可用 kaggle.com/settings → API 的新版 Token（KGAT_ 開頭），或 Create Legacy API Key 下載的 kaggle.json 裡的 key。金鑰只存在這支 iPhone 的鑰匙圈裡。")) {
                 TextField("使用者名稱（例如 chiahsuntu）", text: $username)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
@@ -67,30 +67,53 @@ struct SettingsView: View {
 
         KaggleClient.resetAuthMode()
         let client = KaggleClient(username: u, key: k)
+        func short(_ e: Error) -> String { String(e.localizedDescription.prefix(160)) }
+
+        var tokenOK = false
         do {
             let r = try await client.call("security.OAuthService", "IntrospectToken", ["token": k])
             let active = (r["active"] as? Bool) ?? false
             let owner = (r["username"] as? String) ?? ""
-            lines.append("Token 檢查：\(active ? "有效" : "無效")\(owner.isEmpty ? "" : "，屬於 \(owner)")")
+            let scope = (r["scope"] as? String) ?? ""
+            tokenOK = active
+            lines.append("① Token：\(active ? "有效" : "無效")\(owner.isEmpty ? "" : "，屬於 \(owner)")")
+            if !scope.isEmpty { lines.append("　權限範圍：\(scope)") }
             if !owner.isEmpty && owner.lowercased() != u.lowercased() {
                 lines.append("⚠️ 這個金鑰屬於「\(owner)」，和你填的使用者名稱不同")
             }
         } catch {
-            lines.append("Token 檢查：略過（\(error.localizedDescription.prefix(60))）")
+            lines.append("① Token：無法檢查（\(short(error))）")
         }
+
+        var uploadOK = false
         do {
-            _ = try await client.call("kernels.KernelsApiService", "GetKernelSessionStatus",
-                                      ["userName": u, "kernelSlug": "obj3d-runner"])
-            lines.append("✅ 驗證成功，可以開始使用")
-        } catch let e as KaggleError {
-            if e.message.contains("（401）") || e.message.contains("（403）") {
-                lines.append("❌ 驗證失敗：請重新產生 API 金鑰並貼上，確認使用者名稱正確")
-            } else {
-                lines.append("✅ 驗證成功（目前還沒有 obj3d-runner 的執行紀錄，這是正常的）")
-            }
+            let r = try await client.call("datasets.DatasetApiService", "UploadDatasetFile", [
+                "fileName": "obj3d_test.txt", "contentLength": 1,
+                "lastModifiedEpochSeconds": Int(Date().timeIntervalSince1970)])
+            uploadOK = (r["createUrl"] as? String) != nil
+            lines.append(uploadOK ? "② 上傳權限：✅" : "② 上傳權限：⚠️ 沒有回傳上傳網址")
         } catch {
-            lines.append("網路錯誤：\(error.localizedDescription)")
+            lines.append("② 上傳權限：❌ \(short(error))")
         }
+
+        do {
+            let r = try await client.call("datasets.DatasetApiService", "GetDatasetStatus",
+                                          ["ownerSlug": u, "datasetSlug": "obj3d-capture-data"])
+            lines.append("③ 資料集：已存在（\((r["status"] as? String) ?? "")）")
+        } catch {
+            lines.append("③ 資料集：尚未建立或無法讀取（\(short(error))）")
+        }
+
+        do {
+            let r = try await client.call("kernels.KernelsApiService", "GetKernelSessionStatus",
+                                          ["userName": u, "kernelSlug": "obj3d-runner"])
+            lines.append("④ 運算程式：\((r["status"] as? String) ?? "")")
+        } catch {
+            lines.append("④ 運算程式：尚未建立或無法讀取（\(short(error))）")
+        }
+
+        lines.append(tokenOK && uploadOK ? "✅ 驗證成功，可以開始生成（③④ 第一次使用時顯示「尚未建立」是正常的）"
+                                         : "❌ 驗證未通過，請把這段結果截圖給我")
         testResult = lines.joined(separator: "\n")
     }
 }

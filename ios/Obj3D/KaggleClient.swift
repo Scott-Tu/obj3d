@@ -10,8 +10,32 @@ struct OutputFile {
     let url: URL
 }
 
+/// iOS 的 URLSession 在轉址時會把 Authorization 標頭拿掉（Python、Go 的用戶端不會），
+/// 這裡在轉址到 kaggle.com 時把驗證標頭和 POST 內容補回去。
+final class KaggleRedirectDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        var r = request
+        if let orig = task.originalRequest, let host = r.url?.host, host.hasSuffix("kaggle.com") {
+            if let auth = orig.value(forHTTPHeaderField: "Authorization") {
+                r.setValue(auth, forHTTPHeaderField: "Authorization")
+            }
+            if orig.httpMethod == "POST" && r.httpMethod != "POST" {
+                r.httpMethod = "POST"
+                r.httpBody = orig.httpBody
+                r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            }
+        }
+        completionHandler(r)
+    }
+}
+
 /// Kaggle 公開 API（https://api.kaggle.com/v1/<服務>/<方法>，POST JSON）
 struct KaggleClient {
+    static let apiSession = URLSession(configuration: .default, delegate: KaggleRedirectDelegate(), delegateQueue: nil)
+
     let username: String
     let key: String
 
@@ -60,14 +84,16 @@ struct KaggleClient {
             req.setValue("kaggle-api/v1.7.0", forHTTPHeaderField: "User-Agent")
             req.setValue(header(mode), forHTTPHeaderField: "Authorization")
             req.httpBody = payload
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await KaggleClient.apiSession.data(for: req)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
             let text = String(data: data, encoding: .utf8) ?? ""
+            let finalURL = resp.url?.absoluteString ?? ""
+            let moved = finalURL.isEmpty || finalURL == url.absoluteString ? "" : "（轉址到 \(finalURL)）"
             if code == 401 || code == 403 {
                 if i < modes.count - 1 { continue }          // 換另一種驗證方式再試一次
                 let detail = (obj["message"] as? String) ?? String(text.prefix(200))
-                throw KaggleError(message: "Kaggle 驗證失敗（\(code)）：\(method)。請到「設定」按「測試 Kaggle 連線」檢查使用者名稱與金鑰。\(detail)")
+                throw KaggleError(message: "Kaggle 驗證失敗（\(code)）：\(method)\(moved)。請到「設定」按「測試 Kaggle 連線」檢查使用者名稱與金鑰。\(detail)")
             }
             if code > 0 && code < 400 {
                 UserDefaults.standard.set(mode, forKey: KaggleClient.modeKey)
@@ -91,12 +117,23 @@ struct KaggleClient {
     func uploadBlob(file: URL) async throws -> String {
         let attrs = try FileManager.default.attributesOfItem(atPath: file.path)
         let size = (attrs[.size] as? NSNumber)?.intValue ?? 0
-        let r = try await call("blobs.BlobApiService", "StartBlobUpload", [
-            "type": "DATASET",
-            "name": file.lastPathComponent,
-            "contentLength": size,
-            "lastModifiedEpochSeconds": Int(Date().timeIntervalSince1970),
-        ])
+        let now = Int(Date().timeIntervalSince1970)
+        var r: [String: Any]
+        do {
+            // 與已在真實 Kaggle 驗證過的用法相同（datasets.UploadDatasetFile）
+            r = try await call("datasets.DatasetApiService", "UploadDatasetFile", [
+                "fileName": file.lastPathComponent,
+                "contentLength": size,
+                "lastModifiedEpochSeconds": now,
+            ])
+        } catch {
+            r = try await call("blobs.BlobApiService", "StartBlobUpload", [
+                "type": "DATASET",
+                "name": file.lastPathComponent,
+                "contentLength": size,
+                "lastModifiedEpochSeconds": now,
+            ])
+        }
         guard let token = r["token"] as? String, let s = r["createUrl"] as? String, let url = URL(string: s) else {
             throw KaggleError(message: "Kaggle 沒有回傳上傳網址")
         }
