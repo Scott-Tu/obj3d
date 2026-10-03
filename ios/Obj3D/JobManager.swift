@@ -82,6 +82,14 @@ final class JobManager: ObservableObject {
             status = "上一次的工作還沒取回結果"
             detail = "按「繼續查詢」取回結果"
         }
+        if let latest = CaptureStore.list().first {            // 自動載入最近一次的錄影
+            captureURL = latest.url
+            if phase != .done && !canResume {
+                phase = .captured
+                status = "已載入上次的錄影（\(latest.frames) 張）"
+                detail = "可以直接按「生成 3D 模型」"
+            }
+        }
     }
 
     func setCapture(url: URL, jobId: String, frames: Int) {
@@ -116,12 +124,32 @@ final class JobManager: ObservableObject {
 
     // MARK: -
 
+    /// 網路不穩時自動重試（Kaggle 回傳的錯誤不重試）
+    private func withRetry<T>(_ label: String, attempts: Int = 4, _ op: () async throws -> T) async throws -> T {
+        var lastError: Error = KaggleError(message: "網路錯誤")
+        for k in 0..<attempts {
+            do {
+                return try await op()
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let e as KaggleError {
+                throw e
+            } catch {
+                lastError = error
+                if k == attempts - 1 { break }
+                status = "\(label)：網路中斷，\(5 + 10 * k) 秒後重試（\(k + 1)/\(attempts - 1)）"
+                try await Task.sleep(nanoseconds: UInt64(5 + 10 * k) * 1_000_000_000)
+            }
+        }
+        throw KaggleError(message: "\(label)失敗：網路連線不穩（\(lastError.localizedDescription)）。建議改用 Wi-Fi，上傳時保持 App 在前景。")
+    }
+
     private func setBusy(_ on: Bool) {
         UIApplication.shared.isIdleTimerDisabled = on      // 等待時螢幕不自動關閉
     }
 
     private func runGenerate() async {
-        guard let dir = captureURL, let jobId = jobId else { return }
+        guard let dir = captureURL else { return }
         guard let client = KaggleClient.fromSettings() else {
             fail("請先到右上角「設定」填入 Kaggle 使用者名稱與 API 金鑰")
             return
@@ -130,14 +158,25 @@ final class JobManager: ObservableObject {
         setBusy(true)
         defer { setBusy(false) }
         do {
+            let jobId = try CaptureStore.assignNewJobId(dir)     // 同一段錄影可以重複生成
+            self.jobId = jobId
             status = "壓縮拍攝資料…"; detail = ""
             let zipURL = try await Task.detached { try Zipper.zip(directory: dir) }.value
             let attrs = try? FileManager.default.attributesOfItem(atPath: zipURL.path)
             let mb = ((attrs?[.size] as? NSNumber)?.doubleValue ?? 0) / 1e6
-            status = "上傳到 Kaggle…"; detail = String(format: "%.0f MB", mb)
-            let token = try await client.uploadBlob(file: zipURL)
+            // 讓 App 切到背景時還能多爭取一些時間把上傳做完
+            var bgTask: UIBackgroundTaskIdentifier = .invalid
+            bgTask = UIApplication.shared.beginBackgroundTask(withName: "obj3d-upload") {
+                UIApplication.shared.endBackgroundTask(bgTask)
+                bgTask = .invalid
+            }
+            defer { if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask) } }
+            status = "上傳到 Kaggle…"; detail = String(format: "%.0f MB，上傳時請保持 App 在前景", mb)
+            let token = try await withRetry("上傳") { try await client.uploadBlob(file: zipURL) }
             status = "建立 Kaggle 資料集…"; detail = ""
-            try await client.pushDataset(slug: datasetSlug, title: "obj3d capture data", fileToken: token)
+            try await withRetry("建立資料集") {
+                try await client.pushDataset(slug: datasetSlug, title: "obj3d capture data", fileToken: token)
+            }
             status = "等待 Kaggle 處理資料…"
             try await Task.sleep(nanoseconds: 20_000_000_000)
             try await client.waitDatasetReady(slug: datasetSlug, timeout: 1200)
@@ -174,11 +213,15 @@ final class JobManager: ObservableObject {
               let template = try? String(contentsOf: url, encoding: .utf8) else {
             throw KaggleError(message: "App 內找不到 runner.py")
         }
+        let smooth = UserDefaults.standard.string(forKey: "smoothLevel") ?? "medium"
         let script = template.replacingOccurrences(of: "__JOB_ID__", with: jobId)
+            .replacingOccurrences(of: "__SMOOTH__", with: smooth)
         let shape = UserDefaults.standard.string(forKey: "machineShape") ?? "NvidiaTeslaT4"
         status = "啟動 Kaggle 運算…"
-        try await client.pushKernel(slug: kernelSlug, title: "obj3d runner", script: script,
-                                    datasetSlug: datasetSlug, machineShape: shape)
+        try await withRetry("啟動運算") {
+            try await client.pushKernel(slug: kernelSlug, title: "obj3d runner", script: script,
+                                        datasetSlug: datasetSlug, machineShape: shape)
+        }
     }
 
     private func poll(client: KaggleClient, jobId: String) async throws {
@@ -188,7 +231,19 @@ final class JobManager: ObservableObject {
             try Task.checkCancellation()
             let elapsed = Date().timeIntervalSince(start)
             if elapsed > 4 * 3600 { throw KaggleError(message: "等待超過 4 小時，請到 Kaggle 網站查看 obj3d-runner") }
-            let (st, failure) = try await client.kernelStatus(slug: kernelSlug)
+            var statusPair: (String, String?)
+            do {
+                statusPair = try await client.kernelStatus(slug: kernelSlug)
+            } catch let e as KaggleError {
+                throw e
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                status = "網路不穩，30 秒後再查詢…"           // 查詢途中斷線不算失敗
+                try await Task.sleep(nanoseconds: 30_000_000_000)
+                continue
+            }
+            let (st, failure) = statusPair
             let s = st.lowercased()
             if s.contains("queued") { status = "Kaggle 排隊中…" }
             else if s.contains("running") { status = "Kaggle 運算中…" }
@@ -196,10 +251,10 @@ final class JobManager: ObservableObject {
             detail = "已等待 \(Int(elapsed / 60)) 分鐘（通常 20~60 分鐘），可以先離開 App，回來後按「繼續查詢」"
 
             if s.contains("complete") || s.contains("error") || s.contains("cancel") {
-                let files = try await client.kernelOutputs(slug: kernelSlug)
+                let files = try await withRetry("讀取結果清單") { try await client.kernelOutputs(slug: kernelSlug) }
                 if let metaFile = files.first(where: { $0.name.hasSuffix("result_meta.json") }) {
                     let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("result_meta.json")
-                    try await client.download(metaFile.url, to: tmp)
+                    try await withRetry("下載結果") { try await client.download(metaFile.url, to: tmp) }
                     if let meta = try? JSONDecoder().decode(ResultMeta.self, from: Data(contentsOf: tmp)),
                        meta.jobId == jobId {
                         if meta.status == "ok" {
@@ -234,7 +289,7 @@ final class JobManager: ObservableObject {
         for name in wanted {
             if let f = files.first(where: { ($0.name as NSString).lastPathComponent == name }) {
                 detail = name
-                try await client.download(f.url, to: dir.appendingPathComponent(name))
+                try await withRetry("下載 \(name)") { try await client.download(f.url, to: dir.appendingPathComponent(name)) }
             }
         }
         guard let r = JobResult.load(jobId: jobId) else { throw KaggleError(message: "結果檔案不完整") }

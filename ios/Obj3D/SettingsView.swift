@@ -3,6 +3,7 @@ import SwiftUI
 struct SettingsView: View {
     @AppStorage("kaggleUsername") private var username = ""
     @AppStorage("machineShape") private var machineShape = "NvidiaTeslaT4"
+    @AppStorage("smoothLevel") private var smoothLevel = "medium"
     @State private var apiKey = Keychain.get("kaggleKey") ?? ""
     @State private var testing = false
     @State private var testResult = ""
@@ -32,6 +33,15 @@ struct SettingsView: View {
                     Text(testResult)
                         .font(.footnote)
                         .textSelection(.enabled)
+                }
+            }
+
+            Section(header: Text("模型"),
+                    footer: Text("光滑的物體（杯子、瓶子）選「高」；有細節紋理的物體選「低」。下次生成時套用，不用重拍。")) {
+                Picker("表面平滑度", selection: $smoothLevel) {
+                    Text("低（保留細節）").tag("low")
+                    Text("中").tag("medium")
+                    Text("高（光滑物體）").tag("high")
                 }
             }
 

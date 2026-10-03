@@ -3,6 +3,8 @@ import SwiftUI
 struct ContentView: View {
     @EnvironmentObject var job: JobManager
     @State private var showCapture = false
+    @State private var showLibrary = false
+    @State private var showRuler = true
 
     var body: some View {
         NavigationStack {
@@ -24,6 +26,9 @@ struct ContentView: View {
                     }
                 }
             }
+            .sheet(isPresented: $showLibrary) {
+                CaptureLibraryView().environmentObject(job)
+            }
             .fullScreenCover(isPresented: $showCapture) {
                 CaptureView { url, jobId, count in
                     job.setCapture(url: url, jobId: jobId, frames: count)
@@ -36,10 +41,12 @@ struct ContentView: View {
     private var previewArea: some View {
         if let r = job.result {
             VStack(spacing: 10) {
-                ModelViewer(url: r.previewURL)
+                ModelViewer(url: r.previewURL, showRuler: showRuler)
                     .id(r.jobId)
                     .frame(height: 380)
                     .clipShape(RoundedRectangle(cornerRadius: 16))
+                Toggle("顯示公分尺規", isOn: $showRuler)
+                    .padding(.horizontal, 4)
                 if !r.shareFiles.isEmpty {
                     ShareLink(items: r.shareFiles) {
                         Label("分享／儲存模型檔（GLB、STL、PLY）", systemImage: "square.and.arrow.up")
@@ -117,7 +124,16 @@ struct ContentView: View {
             .buttonStyle(.borderedProminent)
             .tint(.orange)
             .controlSize(.large)
-            .disabled(job.busy || job.captureURL == nil || !(job.phase == .captured || job.phase == .failed))
+            .disabled(job.busy || job.captureURL == nil)
+
+            Button {
+                showLibrary = true
+            } label: {
+                Label("從錄影存檔載入", systemImage: "folder").frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
+            .disabled(job.busy)
 
             if job.busy {
                 Button("暫停查詢（Kaggle 會繼續運算）") { job.stopWaiting() }

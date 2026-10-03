@@ -5,6 +5,7 @@
 #        preview.bin（App 預覽用）、result_meta.json
 # =====================================================================
 JOB_ID = "__JOB_ID__"
+SMOOTH_LEVEL = "__SMOOTH__"      # low / medium / high（由 App 設定）
 
 import os, sys, json, time, glob, shutil, subprocess, zipfile, traceback
 T0 = time.time()
@@ -13,7 +14,11 @@ TMP = "/tmp/obj3d"
 WARN = []
 
 POISSON_DEPTH = 9
-SMOOTH_ITERS = 3
+SMOOTH_PRESETS = {"low": (0.7, 3, 0), "medium": (1.0, 6, 4), "high": (1.4, 12, 12)}   # (高斯模糊, 實體平滑, 額外平滑)
+if SMOOTH_LEVEL not in SMOOTH_PRESETS:
+    SMOOTH_LEVEL = "medium"
+SMOOTH_BLUR, SMOOTH_TAUBIN, SMOOTH_ITERS = SMOOTH_PRESETS[SMOOTH_LEVEL]
+MAX_BATCHES = 3                  # T4 一次約 50 張，分 3 批 → 最多約 150 張
 CONF_DROP_PERCENT = 40
 HR_TOL = 0.04
 MASK_ERODE_PX = 4
@@ -285,7 +290,8 @@ def color_from_frames(mesh, vidx, frame_paths, masks, intrinsic, Rcam, Ra, Cc, s
     return out
 
 
-def voxel_solid(mesh, vox, close_iters=2, base=None, sink=0.15, min_comp=0.05, max_voxels=40e6, clip_lo=None, clip_hi=None):
+def voxel_solid(mesh, vox, close_iters=2, base=None, sink=0.15, min_comp=0.05, max_voxels=40e6, clip_lo=None, clip_hi=None,
+                blur=0.8, taubin=5):
     """把表面網格轉成「保證封閉」的實體：
     1) 整個網格體素化並填滿內部（Poisson 未修剪的網格本身就是封閉的，填得起來）
     2) 用體積的方式裁掉資料範圍外的部分與桌面以下（裁切後仍是實心，不會開洞）
@@ -330,9 +336,9 @@ def voxel_solid(mesh, vox, close_iters=2, base=None, sink=0.15, min_comp=0.05, m
     if nlab > 1:
         sizes = ndimage.sum(occ, lab, range(1, nlab + 1))
         occ = np.isin(lab, 1 + np.nonzero(sizes >= min_comp * sizes.max())[0])
-    field = ndimage.gaussian_filter(np.pad(occ, 2).astype(np.float32), 0.8)   # 平滑後的等值面不會有非流形邊
+    field = ndimage.gaussian_filter(np.pad(occ, 3).astype(np.float32), blur)   # 平滑後的等值面不會有非流形邊
     v, f, _, _ = measure.marching_cubes(field, level=0.5)
-    V = lo + (v - 2 + 0.5) * vox
+    V = lo + (v - 3 + 0.5) * vox
     m = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(V), o3d.utility.Vector3iVector(f.astype(np.int32)))
     m.remove_duplicated_vertices(); m.remove_degenerate_triangles()
     tc, cnt, _ = m.cluster_connected_triangles()
@@ -342,7 +348,8 @@ def voxel_solid(mesh, vox, close_iters=2, base=None, sink=0.15, min_comp=0.05, m
     import trimesh
     if trimesh.Trimesh(np.asarray(m.vertices), np.asarray(m.triangles), process=False).volume < 0:
         m.triangles = o3d.utility.Vector3iVector(np.asarray(m.triangles)[:, ::-1])
-    m = m.filter_smooth_taubin(number_of_iterations=5)
+    if taubin > 0:
+        m = m.filter_smooth_taubin(number_of_iterations=taubin)
     m.compute_vertex_normals()
     return m, vox
 
@@ -536,6 +543,112 @@ def gpu_memory_gb():
 # =====================================================================
 #  主流程
 # =====================================================================
+def run_vggt_batches(frame_paths, C_ar, n_batch):
+    """分批跑 VGGT（交錯分組），每批各自用 ARKit 軌跡對齊到同一個公尺座標系後合併。"""
+    n = len(frame_paths)
+    B = int(min(MAX_BATCHES, np.ceil(n / n_batch)))
+    groups = [list(range(b, n, B)) for b in range(B)]
+    ext = np.zeros((n, 3, 4), np.float32); Ks = np.zeros((n, 3, 3), np.float32)
+    depth = conf = imgs = None
+    batch_of = np.zeros(n, int)
+    for b, g in enumerate(groups):
+        v = run_vggt([frame_paths[i] for i in g], "pad", True)
+        C, _, _ = cam_centers_dirs(v["extrinsic"])
+        s, R, t = umeyama(C, C_ar[g])
+        res = np.linalg.norm((s * C @ R.T + t) - C_ar[g], axis=1)
+        kf = res <= np.percentile(res, 80)
+        s, R, t = umeyama(C[kf], C_ar[g][kf])
+        for k, i in enumerate(g):
+            Rj = v["extrinsic"][k][:, :3].astype(np.float64); tj = v["extrinsic"][k][:, 3].astype(np.float64)
+            Rn = Rj @ R.T
+            ext[i] = np.hstack([Rn, (s * tj - Rn @ t)[:, None]])
+            Ks[i] = v["intrinsic"][k]
+        if depth is None:
+            depth = np.zeros((n,) + v["depth"].shape[1:], np.float32)
+            conf = np.zeros_like(depth); imgs = np.zeros((n,) + v["imgs"].shape[1:], np.float32)
+        depth[g] = v["depth"] * s; conf[g] = v["conf"]; imgs[g] = v["imgs"]
+        batch_of[g] = b
+        log(f"VGGT 第 {b+1}/{B} 批（{len(g)} 張）完成")
+        del v
+    return ext, Ks, depth, conf, imgs, batch_of, B
+
+
+def batch_points(idx, ext, Ks, depth, conf, mask, stride=2):
+    pts = []
+    for i in idx:
+        d = depth[i][::stride, ::stride]; m = mask[i][::stride, ::stride] & (d > 1e-6)
+        if m.sum() == 0:
+            continue
+        vv, uu = np.nonzero(m); uu = uu * stride; vv = vv * stride
+        z = d[m]; K = Ks[i]
+        Xc = np.stack([(uu - K[0, 2]) * z / K[0, 0], (vv - K[1, 2]) * z / K[1, 1], z], 1)
+        pts.append((Xc - ext[i][:, 3]) @ ext[i][:, :3])
+    return np.concatenate(pts) if pts else np.zeros((0, 3))
+
+
+def icp_refine_batches(ext, Ks, depth, conf, mask, batch_of, B):
+    """以第 1 批為基準，用 ICP 微調其他批的位置（ARKit 對齊後的殘餘誤差）"""
+    if B < 2:
+        return ext
+    def cloud(b):
+        P = batch_points(np.nonzero(batch_of == b)[0], ext, Ks, depth, conf, mask)
+        pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P)).voxel_down_sample(0.002)
+        pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.01, max_nn=30))
+        return pc
+    ref = cloud(0)
+    if len(ref.points) < 500:
+        return ext
+    for b in range(1, B):
+        src = cloud(b)
+        if len(src.points) < 500:
+            continue
+        reg = o3d.pipelines.registration.registration_icp(
+            src, ref, 0.006, np.eye(4), o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=60))
+        T = reg.transformation
+        ang = np.degrees(np.arccos(np.clip((np.trace(T[:3, :3]) - 1) / 2, -1, 1)))
+        mv = np.linalg.norm(T[:3, 3])
+        log(f"ICP 第 {b+1} 批：吻合度 {reg.fitness:.2f}，修正 {mv*100:.2f} cm / {ang:.2f}°")
+        if reg.fitness < 0.3 or mv > 0.02 or ang > 4:
+            WARN.append(f"第 {b+1} 批的 ICP 對齊不可靠，沿用 ARKit 對齊")
+            continue
+        Rt, tt = T[:3, :3], T[:3, 3]
+        for i in np.nonzero(batch_of == b)[0]:
+            Rn = ext[i][:, :3] @ Rt.T
+            ext[i] = np.hstack([Rn, (ext[i][:, 3] - Rn @ tt)[:, None]])
+    return ext
+
+
+def consistency_filter(P, F, extrinsic, intrinsic, depth, frame_ok, box, tol=0.025, min_support=2):
+    """多視角一致性：點要被其他至少 min_support 個視角看到「同一個深度」才保留；
+    若點出現在其他相機看到的表面前方很多（重影），就剔除。"""
+    padL, padT, nw, nh = box
+    S = len(extrinsic)
+    support = np.zeros(len(P), np.int16)
+    viol = np.zeros(len(P), np.int16)
+    for j in range(S):
+        if not frame_ok[j]:
+            continue
+        Xc = P @ extrinsic[j][:, :3].T + extrinsic[j][:, 3]
+        z = Xc[:, 2]
+        K = intrinsic[j]
+        ok = z > 1e-6
+        zs = np.where(ok, z, 1.0)
+        ui = np.round(K[0, 0] * Xc[:, 0] / zs + K[0, 2]).astype(np.int64)
+        vi = np.round(K[1, 1] * Xc[:, 1] / zs + K[1, 2]).astype(np.int64)
+        inb = ok & (ui >= padL) & (ui < padL + nw) & (vi >= padT) & (vi < padT + nh) & (F != j)
+        idx = np.nonzero(inb)[0]
+        if len(idx) == 0:
+            continue
+        d = depth[j][vi[idx], ui[idx]]
+        good = d > 1e-6
+        rel = (z[idx] - d) / np.maximum(d, 1e-9)
+        support[idx[good & (np.abs(rel) < tol)]] += 1
+        viol[idx[good & (rel < -2.5 * tol)]] += 1
+    keep = (support >= min_support) & (viol <= np.maximum(1, support // 2))
+    return keep
+
+
 def main():
     cap_dir, meta = find_capture()
     if cap_dir is None:
@@ -554,7 +667,8 @@ def main():
 
     # ---- 1. 挑影格 ----
     gb = gpu_memory_gb()
-    N = MAX_FRAMES or int(np.clip((gb - 3.5) / 0.23, 16, 150))
+    N_batch = int(np.clip((gb - 3.5) / 0.23, 16, 150))
+    N = MAX_FRAMES or N_batch * MAX_BATCHES
     N = min(N, len(paths))
     sc = np.array([sharpness(p) for p in paths])
     pick = [int(b[np.argmax(sc[b])]) for b in np.array_split(np.arange(len(paths)), N) if len(b)]
@@ -570,9 +684,24 @@ def main():
     log(f"影格 {len(paths)} → 選用 {len(pick)}（GPU {gb:.0f} GB），{W0}x{H0}")
 
     # ---- 2. VGGT 第一次 + SAM 2 ----
-    v1 = run_vggt(frame_paths, "pad", True)
-    extrinsic, intrinsic, depth, conf, imgs = v1["extrinsic"], v1["intrinsic"], v1["depth"], v1["conf"], v1["imgs"]
-    log("VGGT 第一次完成")
+    extrinsic, intrinsic, depth, conf, imgs, batch_of, NB = run_vggt_batches(frame_paths, C_ar, N_batch)
+    log(f"VGGT 第一次完成（{NB} 批，共 {len(frame_paths)} 張）")
+    # 用 ARKit 軌跡檢查 VGGT 的相機位置：差太多的影格不拿來建模
+    Ccam, fwd, Rcam = cam_centers_dirs(extrinsic)
+    s1, R1, t1 = umeyama(Ccam, C_ar)
+    res = np.linalg.norm((s1 * Ccam @ R1.T + t1) - C_ar, axis=1)
+    keep_fit = res <= np.percentile(res, 80)
+    s1, R1, t1 = umeyama(Ccam[keep_fit], C_ar[keep_fit])
+    res = np.linalg.norm((s1 * Ccam @ R1.T + t1) - C_ar, axis=1)
+    rms_cm = float(np.sqrt(np.mean(res[keep_fit] ** 2)) * 100)
+    pose_thr = max(0.02, 3.0 * np.median(res))
+    frame_ok = res <= pose_thr
+    bad_pose = [int(i) for i in np.nonzero(~frame_ok)[0]]
+    log(f"ARKit 對齊：殘差 {rms_cm:.2f} cm；相機位置不一致而略過的影格 {bad_pose}")
+    if rms_cm > 3:
+        WARN.append(f"相機軌跡對齊誤差偏大（{rms_cm:.1f} cm），尺寸可能不準")
+    if len(bad_pose) > 0.3 * len(frame_ok):
+        WARN.append(f"有 {len(bad_pose)} 張影格的相機位置不可靠，建議放慢速度、保持距離重拍")
     prompts = find_prompts(extrinsic, intrinsic, depth, W0, H0, padL, padT, sx, sy)
     target_method = "3D 自動定位"
     if not prompts:
@@ -585,6 +714,8 @@ def main():
     med = float(np.median(area))
     bad = [int(i) for i in np.nonzero((area < 0.2 * med) | (area > 3.0 * med))[0]]
     for i in bad:                                         # 遮罩異常的影格不拿來建物體
+        MASKS[i] = False
+    for i in bad_pose:                                    # 相機位置不可靠的影格也不拿來建物體
         MASKS[i] = False
     log(f"SAM 2 完成，遮罩面積中位數 {med:.1%}，異常影格 {bad}")
     save_mask_diagnostic(frame_paths, MASKS, prompts, set(bad), f"{WORK}/diag_masks.jpg")
@@ -609,7 +740,19 @@ def main():
         p = f"{HR}/{fi:03d}.png"
         Image.open(frame_paths[fi]).convert("RGB").crop((x0, y0, x0 + side, y0 + side)).resize((518, 518), Image.BICUBIC).save(p)
         crop_info[fi] = (x0, y0, side); hr_paths.append(p); hr_fids.append(fi)
-    v2 = run_vggt(hr_paths, "crop", False)
+    v2 = {"depth": [], "conf": [], "imgs": []}
+    hr_order = []
+    for b in range(NB):
+        sel = [j for j, fi in enumerate(hr_fids) if batch_of[fi] == b]
+        if not sel:
+            continue
+        vb = run_vggt([hr_paths[j] for j in sel], "crop", False)
+        for k, j in enumerate(sel):
+            v2["depth"].append(vb["depth"][k]); v2["conf"].append(vb["conf"][k]); v2["imgs"].append(vb["imgs"][k])
+            hr_order.append(j)
+        del vb
+    order = np.argsort(hr_order)
+    v2 = {k: np.stack([v2[k][o] for o in order]) for k in v2}
     log("VGGT 第二次完成")
 
     # ---- 4. 點雲（VGGT 座標）----
@@ -620,6 +763,8 @@ def main():
         m8 = m.astype(np.uint8)
         BMASK[i, padT:padT + nh, padL:padL + nw] = cv2.resize(cv2.erode(m8, k3, iterations=MASK_ERODE_PX), (nw, nh), interpolation=cv2.INTER_NEAREST) > 0
         BDIL[i, padT:padT + nh, padL:padL + nw] = cv2.resize(cv2.dilate(m8, k3, iterations=12), (nw, nh), interpolation=cv2.INTER_NEAREST) > 0
+    extrinsic = icp_refine_batches(extrinsic, intrinsic, depth, conf, BMASK, batch_of, NB)
+    Ccam, fwd, Rcam = cam_centers_dirs(extrinsic)
     u_, v_ = np.meshgrid(np.arange(W), np.arange(H))
     fx, fy = intrinsic[:, 0, 0, None, None], intrinsic[:, 1, 1, None, None]
     cx, cy = intrinsic[:, 0, 2, None, None], intrinsic[:, 1, 2, None, None]
@@ -629,7 +774,7 @@ def main():
     valid = np.zeros(depth.shape, bool)
     valid[:, padT + 2:padT + nh - 2, padL + 2:padL + nw - 2] = True
     valid &= depth > 1e-6
-    bg_px = valid & ~BDIL
+    bg_px = valid & ~BDIL & frame_ok[:, None, None]
     bg_px &= conf >= np.percentile(conf[bg_px], CONF_DROP_PERCENT)
     P_bg0 = world[bg_px].astype(np.float64)
     COL_bg = np.clip(imgs[bg_px].astype(np.float64), 0, 1)
@@ -672,19 +817,16 @@ def main():
     else:
         WARN.append("高解析推論沒有可用的點，改用第一次推論")
         P_obj0, COL_obj, FID_obj = P_obj1, np.clip(imgs[obj_px], 0, 1).astype(np.float64), np.nonzero(obj_px)[0]
+    ok_mask = frame_ok & np.array([not np.all(~m) for m in MASKS])
+    keepc = consistency_filter(P_obj0, FID_obj, extrinsic, intrinsic, depth, ok_mask, (padL, padT, nw, nh))
+    log(f"多視角一致性：保留 {keepc.mean():.0%} 的物體點")
+    if keepc.mean() < 0.15:
+        WARN.append("多視角一致性過低，可能是拍攝太快或光線太暗")
+    else:
+        P_obj0, COL_obj, FID_obj = P_obj0[keepc], COL_obj[keepc], FID_obj[keepc]
     log(f"物體點 {len(P_obj0):,}，背景點 {len(P_bg0):,}")
 
-    # ---- 5. 用 ARKit 相機位置換算真實尺寸（公尺）與重力方向 ----
-    Ccam, fwd, Rcam = cam_centers_dirs(extrinsic)
-    s1, R1, t1 = umeyama(Ccam, C_ar)
-    res = np.linalg.norm((s1 * Ccam @ R1.T + t1) - C_ar, axis=1)
-    keep = res <= np.percentile(res, 80)
-    s1, R1, t1 = umeyama(Ccam[keep], C_ar[keep])
-    res = np.linalg.norm((s1 * Ccam @ R1.T + t1) - C_ar, axis=1)
-    rms_cm = float(np.sqrt(np.mean(res[keep] ** 2)) * 100)
-    log(f"ARKit 對齊：殘差 {rms_cm:.2f} cm")
-    if rms_cm > 3:
-        WARN.append(f"相機軌跡對齊誤差偏大（{rms_cm:.1f} cm），尺寸可能不準")
+    # ---- 5. 用 ARKit 相機位置換算真實尺寸（公尺）與重力方向（相似轉換已在前面算好）----
     M = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], float)     # ARKit y-up → z-up
     to_cm1 = lambda P: 100.0 * ((s1 * P @ R1.T + t1) @ M.T)
     Pb1, Pg1, C1 = to_cm1(P_obj0), to_cm1(P_bg0), to_cm1(Ccam)
@@ -726,7 +868,9 @@ def main():
     # ---- 7. 匯出 ----
     export_all(mesh)
     ext = bp.max(0) - bp.min(0)
-    info.update(target_method=target_method, prompt_frames=len(prompts),
+    info.update(target_method=target_method, prompt_frames=len(prompts), bad_pose_frames=len(bad_pose),
+                batches=int(NB), smooth_level=SMOOTH_LEVEL,
+                consistency_keep=round(float(keepc.mean()), 3),
                 mask_area_median=round(med, 4), bad_mask_frames=len(bad))
     write_meta(status="ok", size_cm=[round(float(ext[0]), 1), round(float(ext[1]), 1), round(float(bp[:, 2].max()), 1)],
                frames_used=len(frame_paths), scale_residual_cm=round(rms_cm, 2), **info)
@@ -776,7 +920,8 @@ def build_mesh(Pc_b, COL_b, FID_b, Pc_g, COL_g, Cc, U, has_table):
     use_base = has_table and tm.sum() > 200
     margin = 0.3 * U
     mesh, vox = voxel_solid(pm, SOLID_VOXEL * U, base=(cxy, R_base, T_BASE) if use_base else None, sink=SINK,
-                            clip_lo=bp.min(0) - margin, clip_hi=bp.max(0) + margin)
+                            clip_lo=bp.min(0) - margin, clip_hi=bp.max(0) + margin,
+                            blur=SMOOTH_BLUR, taubin=SMOOTH_TAUBIN)
     if SMOOTH_ITERS > 0:
         mesh = mesh.filter_smooth_taubin(number_of_iterations=SMOOTH_ITERS)
         mesh.compute_vertex_normals()
