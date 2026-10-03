@@ -19,6 +19,9 @@ struct ResultMeta: Codable {
     let scale_residual_cm: Double?
     let elapsed_s: Double?
     let warnings: [String]?
+    let target_method: String?
+    let bad_mask_frames: Int?
+    let frames_used: Int?
 }
 
 struct JobResult {
@@ -29,6 +32,12 @@ struct JobResult {
     var previewURL: URL { dir.appendingPathComponent("preview.bin") }
     var shareFiles: [URL] {
         ["model.glb", "model_mm.stl", "model_mm.ply"]
+            .map { dir.appendingPathComponent($0) }
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    var diagnosticImages: [URL] {
+        ["diag_masks.jpg", "diag_cameras.png"]
             .map { dir.appendingPathComponent($0) }
             .filter { FileManager.default.fileExists(atPath: $0.path) }
     }
@@ -220,7 +229,8 @@ final class JobManager: ObservableObject {
         status = "下載模型…"
         let dir = AppPaths.results.appendingPathComponent(jobId)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let wanted = ["result_meta.json", "preview.bin", "model.glb", "model_mm.stl", "model_mm.ply"]
+        let wanted = ["result_meta.json", "preview.bin", "model.glb", "model_mm.stl", "model_mm.ply",
+                      "diag_masks.jpg", "diag_cameras.png"]
         for name in wanted {
             if let f = files.first(where: { ($0.name as NSString).lastPathComponent == name }) {
                 detail = name
@@ -238,7 +248,11 @@ final class JobManager: ObservableObject {
         if let s = r.meta.size_cm, s.count == 3 {
             lines.append(String(format: "尺寸：寬 %.1f × 深 %.1f × 高 %.1f cm", s[0], s[1], s[2]))
         }
-        if r.meta.watertight == true { lines.append("封閉無破孔") }
+        lines.append(r.meta.watertight == true ? "封閉無破孔 ✅" : "⚠️ 模型未完全封閉")
+        if let t = r.meta.target_method {
+            lines.append("物體定位：\(t)" + (r.meta.frames_used.map { "，使用 \($0) 張影格" } ?? ""))
+        }
+        if let b = r.meta.bad_mask_frames, b > 0 { lines.append("略過 \(b) 張遮罩異常的影格") }
         if let w = r.meta.warnings, !w.isEmpty { lines.append("注意：" + w.joined(separator: "；")) }
         detail = lines.joined(separator: "\n")
     }

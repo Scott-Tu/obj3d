@@ -422,19 +422,18 @@ def run_vggt(paths, mode, with_camera):
     return out
 
 
-def run_sam(sel_dir, n, W0, H0):
-    """自動提示：物體在畫面中央（App 拍攝時有十字準心）"""
+def run_sam(sel_dir, n, W0, H0, prompts):
+    """prompts = {影格編號: (x, y)}：物體在該影格上的位置（由 3D 定位算出）"""
     import torch
     from sam2.sam2_video_predictor import SAM2VideoPredictor
     pred = SAM2VideoPredictor.from_pretrained("facebook/sam2.1-hiera-large")
     bf16 = torch.cuda.get_device_capability()[0] >= 8
     masks = np.zeros((n, H0, W0), bool)
-    pf = sorted(set(np.linspace(0, n - 1, 4).astype(int).tolist()))
     with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
         st = pred.init_state(sel_dir, offload_video_to_cpu=True)
-        for fi in pf:
+        for fi, (x, y) in prompts.items():
             pred.add_new_points_or_box(st, frame_idx=int(fi), obj_id=1,
-                                       points=np.array([[W0 / 2, H0 / 2]], np.float32),
+                                       points=np.array([[x, y]], np.float32),
                                        labels=np.array([1], np.int32))
         for rev in (False, True):
             for fidx, _, lg in pred.propagate_in_video(st, reverse=rev):
@@ -442,6 +441,91 @@ def run_sam(sel_dir, n, W0, H0):
     del pred, st
     torch.cuda.empty_cache()
     return masks
+
+
+def find_prompts(extrinsic, intrinsic, depth, W0, H0, padL, padT, sx, sy, n_prompts=4):
+    """用 3D 找物體：所有相機視線最集中的點＝物體位置，再投影回每張影格。
+    不依賴「物體剛好在畫面中央」，拍攝時偶爾偏掉也沒關係。"""
+    C, fwd, _ = cam_centers_dirs(extrinsic)
+    d = fwd / np.linalg.norm(fwd, axis=1, keepdims=True)
+    P = nearest_point_to_lines(C, d)
+    for _ in range(4):                                   # 加權重算，降低偏掉的影格的影響
+        v = P - C
+        dist = np.linalg.norm(v - (v * d).sum(1, keepdims=True) * d, axis=1)
+        w = 1.0 / (dist + np.median(dist) + 1e-9)
+        A = np.zeros((3, 3)); b = np.zeros(3)
+        for c_, u_, wi in zip(C, d, w):
+            Mx = wi * (np.eye(3) - np.outer(u_, u_)); A += Mx; b += Mx @ c_
+        P = np.linalg.lstsq(A, b, rcond=None)[0]
+    n = len(extrinsic)
+    info = [None] * n
+    for i in range(n):
+        Xc = extrinsic[i][:, :3] @ P + extrinsic[i][:, 3]
+        if Xc[2] <= 0:
+            continue
+        K = intrinsic[i]
+        up = K[0, 0] * Xc[0] / Xc[2] + K[0, 2]
+        vp = K[1, 1] * Xc[1] / Xc[2] + K[1, 2]
+        uo = (up - padL + 0.5) / sx - 0.5
+        vo = (vp - padT + 0.5) / sy - 0.5
+        if not (0 <= uo < W0 and 0 <= vo < H0):
+            continue
+        ui = int(np.clip(round(up), 2, depth.shape[2] - 3)); vi = int(np.clip(round(vp), 2, depth.shape[1] - 3))
+        dpix = np.median(depth[i][vi - 2:vi + 3, ui - 2:ui + 3])
+        if dpix > Xc[2] * 1.05:                          # 這個位置看到的是物體後面的背景
+            continue
+        dc = np.hypot((uo - W0 / 2) / (W0 / 2), (vo - H0 / 2) / (H0 / 2))
+        info[i] = (dc, float(uo), float(vo))
+    prompts = {}
+    for bidx in np.array_split(np.arange(n), n_prompts):
+        cands = [(info[i][0], i) for i in bidx if info[i] is not None and info[i][0] < 0.7]
+        if cands:
+            _, i = min(cands)
+            prompts[int(i)] = (info[i][1], info[i][2])
+    return prompts
+
+
+def save_mask_diagnostic(frame_paths, masks, prompts, bad, path):
+    from PIL import ImageDraw
+    idx = np.linspace(0, len(frame_paths) - 1, 12).astype(int)
+    tw, th = 240, 320
+    sheet = Image.new("RGB", (tw * 4, th * 3), (40, 40, 40))
+    for k, i in enumerate(idx):
+        im = np.asarray(Image.open(frame_paths[i]).convert("RGB").resize((tw, th))).astype(np.float32)
+        m = np.asarray(Image.fromarray(masks[i].astype(np.uint8) * 255).resize((tw, th))) > 127
+        im[~m] *= 0.3
+        tile = Image.fromarray(im.astype(np.uint8))
+        dr = ImageDraw.Draw(tile)
+        sxr, syr = tw / masks.shape[2], th / masks.shape[1]
+        if i in prompts:
+            x, y = prompts[i]
+            dr.ellipse([x * sxr - 9, y * syr - 9, x * sxr + 9, y * syr + 9], outline=(0, 255, 0), width=4)
+        label = f"#{i}" + (" BAD" if i in bad else "") + (" PROMPT" if i in prompts else "")
+        dr.rectangle([0, 0, 8 * len(label) + 8, 16], fill=(0, 0, 0))
+        dr.text((4, 2), label, fill=(255, 255, 0) if i in bad else (255, 255, 255))
+        sheet.paste(tile, ((k % 4) * tw, (k // 4) * th))
+    # 提示影格另外補上（若不在上面 12 張裡）
+    sheet.save(path, quality=88)
+
+
+def save_camera_diagnostic(Cc, Pb, Pg, path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    rng = np.random.default_rng(0)
+    sb = Pb[rng.choice(len(Pb), min(30000, len(Pb)), replace=False)]
+    near = np.linalg.norm(Pg[:, :2], axis=1) < max(30, 1.5 * np.ptp(sb[:, :2], axis=0).max())
+    pg = Pg[near]
+    sg = pg[rng.choice(len(pg), min(40000, len(pg)), replace=False)] if len(pg) else pg
+    fig, axs = plt.subplots(1, 2, figsize=(12, 6))
+    for ax, (a, b), title in zip(axs, ((0, 1), (0, 2)), ("Top view (cm)", "Side view (cm)")):
+        if len(sg):
+            ax.scatter(sg[:, a], sg[:, b], s=0.2, c="0.6")
+        ax.scatter(sb[:, a], sb[:, b], s=0.3, c="red")
+        ax.plot(Cc[:, a], Cc[:, b], "b.-", lw=0.8, ms=4)
+        ax.set_title(title + "  red=object  blue=camera"); ax.axis("equal"); ax.grid(alpha=0.3)
+    axs[1].axhline(0, color="k", lw=0.8)
+    plt.tight_layout(); plt.savefig(path, dpi=90); plt.close(fig)
 
 
 def gpu_memory_gb():
@@ -489,13 +573,27 @@ def main():
     v1 = run_vggt(frame_paths, "pad", True)
     extrinsic, intrinsic, depth, conf, imgs = v1["extrinsic"], v1["intrinsic"], v1["depth"], v1["conf"], v1["imgs"]
     log("VGGT 第一次完成")
-    MASKS = run_sam(SEL, len(frame_paths), W0, H0)
+    prompts = find_prompts(extrinsic, intrinsic, depth, W0, H0, padL, padT, sx, sy)
+    target_method = "3D 自動定位"
+    if not prompts:
+        target_method = "畫面中央（3D 定位失敗）"
+        WARN.append("無法用 3D 定位物體，改用畫面中央")
+        prompts = {int(i): (W0 / 2, H0 / 2) for i in sorted(set(np.linspace(0, len(frame_paths) - 1, 4).astype(int)))}
+    log(f"物體定位（{target_method}）：提示影格 {sorted(prompts)}")
+    MASKS = run_sam(SEL, len(frame_paths), W0, H0, prompts)
     area = MASKS.reshape(len(MASKS), -1).mean(1)
-    log(f"SAM 2 完成，遮罩面積中位數 {np.median(area):.1%}")
-    if np.median(area) < 0.005:
-        raise RuntimeError("畫面中央找不到物體：拍攝時請讓物體一直在十字準心上")
-    if np.median(area) > 0.8:
+    med = float(np.median(area))
+    bad = [int(i) for i in np.nonzero((area < 0.2 * med) | (area > 3.0 * med))[0]]
+    for i in bad:                                         # 遮罩異常的影格不拿來建物體
+        MASKS[i] = False
+    log(f"SAM 2 完成，遮罩面積中位數 {med:.1%}，異常影格 {bad}")
+    save_mask_diagnostic(frame_paths, MASKS, prompts, set(bad), f"{WORK}/diag_masks.jpg")
+    if med < 0.005:
+        raise RuntimeError("找不到物體：請讓物體保持在畫面中，並繞著物體拍一圈")
+    if med > 0.8:
         WARN.append("遮罩幾乎佔滿畫面，可能選到背景")
+    if len(bad) > 0.3 * len(MASKS):
+        WARN.append(f"有 {len(bad)} 張影格的遮罩異常，請看診斷圖")
 
     # ---- 3. 高解析第二次推論（只裁物體附近）----
     HR = f"{TMP}/crops"
@@ -611,6 +709,11 @@ def main():
     Pc_b, Pc_g, Cc = to_al(P_obj0), to_al(P_bg0), to_al(Ccam)
     del P_obj0, P_bg0
 
+    try:
+        save_camera_diagnostic(Cc, Pc_b, Pc_g, f"{WORK}/diag_cameras.png")
+    except Exception as e:
+        log("相機診斷圖失敗：", e)
+
     # ---- 6. 網格 ----
     mesh, bp, info, vox = build_mesh(Pc_b, COL_obj, FID_obj, Pc_g, COL_bg, Cc, U, has_table)
     is_obj = np.asarray(mesh.vertices)[:, 2] > 1.5 * vox
@@ -623,6 +726,8 @@ def main():
     # ---- 7. 匯出 ----
     export_all(mesh)
     ext = bp.max(0) - bp.min(0)
+    info.update(target_method=target_method, prompt_frames=len(prompts),
+                mask_area_median=round(med, 4), bad_mask_frames=len(bad))
     write_meta(status="ok", size_cm=[round(float(ext[0]), 1), round(float(ext[1]), 1), round(float(bp[:, 2].max()), 1)],
                frames_used=len(frame_paths), scale_residual_cm=round(rms_cm, 2), **info)
     log("全部完成")

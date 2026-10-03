@@ -45,6 +45,25 @@ struct ContentView: View {
                         Label("分享／儲存模型檔（GLB、STL、PLY）", systemImage: "square.and.arrow.up")
                     }
                 }
+                if !r.diagnosticImages.isEmpty {
+                    DisclosureGroup("診斷圖（結果不理想時查看）") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("遮罩檢查：只有物體應該是亮的；綠圈＝程式自動找到的物體位置；標 BAD 的影格已略過。")
+                                .font(.footnote).foregroundColor(.secondary)
+                            ForEach(r.diagnosticImages, id: \.self) { url in
+                                if let img = UIImage(contentsOfFile: url.path) {
+                                    Image(uiImage: img)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                                }
+                            }
+                            Text("相機軌跡：藍線＝拍攝路徑（應繞物體一圈），紅色＝物體，側視圖中物體應在 0 的水平線上方。")
+                                .font(.footnote).foregroundColor(.secondary)
+                        }
+                    }
+                    .padding(.horizontal, 4)
+                }
             }
         } else {
             VStack(spacing: 12) {
