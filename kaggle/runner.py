@@ -5,7 +5,7 @@
 #        preview.bin（App 預覽用）、result_meta.json
 # =====================================================================
 JOB_ID = "__JOB_ID__"
-RUNNER_VERSION = "2026.10.07-video-import"   # 每次修改運算程式時更新
+RUNNER_VERSION = "2026.10.07c-solid-fill"   # 每次修改運算程式時更新
 SMOOTH_LEVEL = "__SMOOTH__"      # low / medium / high（由 App 設定）
 
 import os, sys, json, time, glob, shutil, subprocess, zipfile, traceback
@@ -417,9 +417,9 @@ def bake_texture(mesh, color_fn, tex_size=2048, max_faces=200_000):
 def voxel_solid(mesh, vox, close_iters=2, base=None, sink=0.15, min_comp=0.05, max_voxels=40e6, clip_lo=None, clip_hi=None,
                 blur=0.8, taubin=5):
     """把表面網格轉成「保證封閉」的實體：
-    1) 整個網格體素化並填滿內部（Poisson 未修剪的網格本身就是封閉的，填得起來）
-    2) 用體積的方式裁掉資料範圍外的部分與桌面以下（裁切後仍是實心，不會開洞）
-    3) 加上實心底座，Marching Cubes 轉回表面。base = (中心 xy, 半徑, 厚度) 或 None"""
+    1) 網格體素化，先切掉桌面以下並加上底座（把底部封起來）
+    2) 填滿內部（小破洞先用較強的閉運算封住再判斷內部）
+    3) 用體積方式裁掉資料範圍外的部分，Marching Cubes 轉回表面。base = (中心 xy, 半徑, 厚度) 或 None"""
     from scipy import ndimage
     from skimage import measure
     lo = np.asarray(mesh.get_min_bound(), float).copy(); hi = np.asarray(mesh.get_max_bound(), float).copy()
@@ -439,23 +439,39 @@ def voxel_solid(mesh, vox, close_iters=2, base=None, sink=0.15, min_comp=0.05, m
     occ = ndimage.binary_dilation(occ, structure=st, iterations=1)
     if close_iters > 0:
         occ = ndimage.binary_closing(occ, structure=st, iterations=close_iters)
-    occ = ndimage.binary_fill_holes(occ)
-    occ = ndimage.binary_erosion(occ, structure=st, iterations=1)
     xc = lo[0] + (np.arange(shape[0]) + 0.5) * vox
     yc = lo[1] + (np.arange(shape[1]) + 0.5) * vox
     zc = lo[2] + (np.arange(shape[2]) + 0.5) * vox
-    if clip_lo is not None:                                    # 體積裁切：資料範圍外的 Poisson 外插部分
-        occ &= ((xc >= clip_lo[0]) & (xc <= clip_hi[0]))[:, None, None]
-        occ &= ((yc >= clip_lo[1]) & (yc <= clip_hi[1]))[None, :, None]
-        occ &= (zc <= clip_hi[2])[None, None, :]
-    occ[:, :, zc < -sink] = False
+    # 先切掉桌面以下、加上底座：Poisson 在看不到的底部常是開口的，必須先封住才能填滿內部
+    base_occ = None
     if base is not None:
         disk = ((xc[:, None] - cxy[0]) ** 2 + (yc[None, :] - cxy[1]) ** 2) <= R * R
         zsel = (zc >= -T) & (zc <= 0)
-        occ[:, :, zc < 0] = False
+        occ[:, :, zc < -sink] = False
         occ[:, :, zsel] |= disk[:, :, None]
+        occ[:, :, zc < -T] = False
+        base_occ = (disk[:, :, None] & zsel[None, None, :])
     else:
         occ[:, :, zc < 0] = False
+        k0 = int(np.argmax(zc >= 0))
+        for k in range(k0, min(k0 + 3, shape[2])):
+            occ[:, :, k] = ndimage.binary_fill_holes(occ[:, :, k])
+    heavy = max(close_iters, int(round(0.5 / vox)))
+    sealed = ndimage.binary_closing(np.pad(occ, heavy), structure=st, iterations=heavy)[heavy:-heavy, heavy:-heavy, heavy:-heavy]
+    inside = ndimage.binary_fill_holes(sealed) & ~sealed
+    occ = ndimage.binary_fill_holes(occ) | inside
+    occ = ndimage.binary_erosion(occ, structure=st, iterations=1)   # 抵銷前面膨脹的一層
+    if base_occ is not None:
+        occ |= base_occ
+    if clip_lo is not None:                                    # 體積裁切：資料範圍外的 Poisson 外插部分
+        keep_z = (zc <= clip_hi[2])
+        if base_occ is not None:
+            occ &= (((xc >= clip_lo[0]) & (xc <= clip_hi[0]))[:, None, None] & ((yc >= clip_lo[1]) & (yc <= clip_hi[1]))[None, :, None]
+                    & keep_z[None, None, :]) | base_occ
+        else:
+            occ &= ((xc >= clip_lo[0]) & (xc <= clip_hi[0]))[:, None, None]
+            occ &= ((yc >= clip_lo[1]) & (yc <= clip_hi[1]))[None, :, None]
+            occ &= keep_z[None, None, :]
     lab, nlab = ndimage.label(occ)
     if nlab > 1:
         sizes = ndimage.sum(occ, lab, range(1, nlab + 1))
@@ -465,10 +481,14 @@ def voxel_solid(mesh, vox, close_iters=2, base=None, sink=0.15, min_comp=0.05, m
     V = lo + (v - 3 + 0.5) * vox
     m = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(V), o3d.utility.Vector3iVector(f.astype(np.int32)))
     m.remove_duplicated_vertices(); m.remove_degenerate_triangles()
+    Fm = np.asarray(m.triangles)                          # 移除正反重疊的重複面（會造成非流形邊）
+    _, inv_, cnt_ = np.unique(np.sort(Fm, axis=1), axis=0, return_inverse=True, return_counts=True)
+    if (cnt_ > 1).any():
+        m.remove_triangles_by_mask(cnt_[inv_.ravel()] > 1); m.remove_unreferenced_vertices()
     tc, cnt, _ = m.cluster_connected_triangles()
     tc = np.asarray(tc); cnt = np.asarray(cnt)
     if len(cnt) > 1:
-        m.remove_triangles_by_mask(~(cnt >= 0.01 * cnt.max())[tc]); m.remove_unreferenced_vertices()
+        m.remove_triangles_by_mask(~(cnt >= max(100, 0.01 * cnt.max()))[tc]); m.remove_unreferenced_vertices()
     import trimesh
     if trimesh.Trimesh(np.asarray(m.vertices), np.asarray(m.triangles), process=False).volume < 0:
         m.triangles = o3d.utility.Vector3iVector(np.asarray(m.triangles)[:, ::-1])
@@ -539,6 +559,13 @@ def run_vggt(paths, mode, with_camera):
     with torch.no_grad():
         with torch.autocast("cuda", dtype=dtype):
             tokens, ps_idx = model.aggregator(images[None])
+        # 各預測頭用 float32 權重：只把會用到的幾層轉成 float32，其餘層直接釋放（同時省下不少 GPU 記憶體）
+        # 修正：在支援 bfloat16 的 GPU 上會出現「mat1 and mat2 must have the same dtype」錯誤
+        tokens = list(tokens)
+        need = set(getattr(model.depth_head, "intermediate_layer_idx", [4, 11, 17, 23])) | {len(tokens) - 1}
+        for i in range(len(tokens)):
+            tokens[i] = tokens[i].float() if i in need else None
+        torch.cuda.empty_cache()
         if with_camera:
             pose_enc = model.camera_head(tokens)[-1]
             e, k = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
@@ -555,23 +582,7 @@ def run_vggt(paths, mode, with_camera):
 
 def run_sam(sel_dir, n, W0, H0, prompts):
     """prompts = {影格編號: (x, y)}：物體在該影格上的位置（由 3D 定位算出）"""
-    import torch
-    from sam2.sam2_video_predictor import SAM2VideoPredictor
-    pred = SAM2VideoPredictor.from_pretrained("facebook/sam2.1-hiera-large")
-    bf16 = torch.cuda.get_device_capability()[0] >= 8
-    masks = np.zeros((n, H0, W0), bool)
-    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
-        st = pred.init_state(sel_dir, offload_video_to_cpu=True)
-        for fi, (x, y) in prompts.items():
-            pred.add_new_points_or_box(st, frame_idx=int(fi), obj_id=1,
-                                       points=np.array([[x, y]], np.float32),
-                                       labels=np.array([1], np.int32))
-        for rev in (False, True):
-            for fidx, _, lg in pred.propagate_in_video(st, reverse=rev):
-                masks[fidx] |= (lg[0, 0] > 0).cpu().numpy()
-    del pred, st
-    torch.cuda.empty_cache()
-    return masks
+    return run_sam_objects(sel_dir, n, W0, H0, {1: {int(fi): [(x, y)] for fi, (x, y) in prompts.items()}})[1]
 
 
 def find_prompts(extrinsic, intrinsic, depth, W0, H0, padL, padT, sx, sy, n_prompts=4):
@@ -673,18 +684,28 @@ def run_sam_objects(sel_dir, n, W0, H0, objs):
     from sam2.sam2_video_predictor import SAM2VideoPredictor
     pred = SAM2VideoPredictor.from_pretrained("facebook/sam2.1-hiera-large")
     bf16 = torch.cuda.get_device_capability()[0] >= 8
-    masks = {int(o): np.zeros((n, H0, W0), bool) for o in objs}
-    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
-        st = pred.init_state(sel_dir, offload_video_to_cpu=True)
-        for oid, frs in objs.items():
-            for fi, pts in frs.items():
-                pred.add_new_points_or_box(st, frame_idx=int(fi), obj_id=int(oid),
-                                           points=np.array(pts, np.float32), labels=np.ones(len(pts), np.int32))
-        for rev in (False, True):
-            for fidx, obj_ids, lg in pred.propagate_in_video(st, reverse=rev):
-                for k, oid in enumerate(obj_ids):
-                    masks[int(oid)][fidx] |= (lg[k, 0] > 0).cpu().numpy()
-    del pred, st
+    def _track(use_bf16):
+        masks = {int(o): np.zeros((n, H0, W0), bool) for o in objs}
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+            st = pred.init_state(sel_dir, offload_video_to_cpu=True)
+            for oid, frs in objs.items():
+                for fi, pts in frs.items():
+                    pred.add_new_points_or_box(st, frame_idx=int(fi), obj_id=int(oid),
+                                               points=np.array(pts, np.float32), labels=np.ones(len(pts), np.int32))
+            for rev in (False, True):
+                for fidx, obj_ids, lg in pred.propagate_in_video(st, reverse=rev):
+                    for k, oid in enumerate(obj_ids):
+                        masks[int(oid)][fidx] |= (lg[k, 0] > 0).cpu().numpy()
+        return masks
+    try:
+        masks = _track(bf16)
+    except RuntimeError as e:
+        if not bf16 or "dtype" not in str(e):
+            raise
+        log("SAM 2 bfloat16 失敗，改用 float32 重跑：", str(e)[:120])
+        torch.cuda.empty_cache()
+        masks = _track(False)
+    del pred
     torch.cuda.empty_cache()
     return masks
 
