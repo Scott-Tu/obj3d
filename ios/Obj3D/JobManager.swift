@@ -284,7 +284,7 @@ final class JobManager: ObservableObject {
         status = "下載模型…"
         let dir = AppPaths.results.appendingPathComponent(jobId)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let wanted = ["result_meta.json", "preview.bin", "model.glb", "model_mm.stl", "model_mm.ply",
+        let wanted = ["result_meta.json", "preview.bin", "preview_tex.jpg", "model.glb", "model_mm.stl", "model_mm.ply",
                       "diag_masks.jpg", "diag_cameras.png"]
         for name in wanted {
             if let f = files.first(where: { ($0.name as NSString).lastPathComponent == name }) {

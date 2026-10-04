@@ -19,6 +19,9 @@ if SMOOTH_LEVEL not in SMOOTH_PRESETS:
     SMOOTH_LEVEL = "medium"
 SMOOTH_BLUR, SMOOTH_TAUBIN, SMOOTH_ITERS = SMOOTH_PRESETS[SMOOTH_LEVEL]
 MAX_BATCHES = 3                  # T4 一次約 50 張，分 3 批 → 最多約 150 張
+USE_TSDF = True                  # 深度圖用 TSDF 融合（平均掉雜訊，表面更平滑）
+TEXTURE_SIZE = 2048              # 貼圖解析度
+TSDF_MAX_RES = 384               # TSDF 格子數上限（每邊）
 CONF_DROP_PERCENT = 40
 HR_TOL = 0.04
 MASK_ERODE_PX = 4
@@ -231,31 +234,34 @@ def poisson_mesh(pcd, depth, trim_q, bbox_min, bbox_max, keep_largest=False, max
     return mesh
 
 
-def color_from_frames(mesh, vidx, frame_paths, masks, intrinsic, Rcam, Ra, Cc, sx, sy, padL, padT,
-                      sharp, fallback, topk=3, min_cos=0.2):
-    """從原始解析度影片幀投影取色：遮擋判斷 + 取「最正面、最清晰」的前 topk 個視角加權平均"""
+def project_colors(P, N, mesh, frame_paths, masks, intrinsic, Rcam, Ra, Cc, sx, sy, padL, padT,
+                   sharp, fallback, topk=5, min_cos=0.2, eps=0.08):
+    """把 3D 點投影回原始解析度影格取色：遮擋判斷後，取「最正面、最近、最清晰」的前 topk 個視角，
+    再取各色頻的中位數（自動排除反光亮點）。P、N、Cc 的單位與 mesh 相同（公分）。"""
     import cv2
-    V = np.asarray(mesh.vertices)[vidx]
-    N = np.asarray(mesh.vertex_normals)[vidx]
     scene = o3d.t.geometry.RaycastingScene()
     scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
-    best_w = np.zeros((len(V), topk), np.float32)
-    best_c = np.zeros((len(V), topk, 3), np.float32)
+    n = len(P)
+    best_w = np.zeros((n, topk), np.float32)
+    best_c = np.zeros((n, topk, 3), np.float32)
     sharp = np.asarray(sharp, float); sharp = np.sqrt(sharp / np.median(sharp))
     kd = np.ones((3, 3), np.uint8)
     for fi, path in enumerate(frame_paths):
+        if masks is not None and not masks[fi].any():
+            continue
         img = cv2.cvtColor(cv2.imread(path), cv2.COLOR_BGR2RGB).astype(np.float32) / 255
         H0, W0 = img.shape[:2]
         K = intrinsic[fi]
         fx, fy = K[0, 0] / sx, K[1, 1] / sy
         cx, cy = (K[0, 2] - padL + 0.5) / sx - 0.5, (K[1, 2] - padT + 0.5) / sy - 0.5
-        R2 = Rcam[fi] @ Ra.T                     # aligned(cm) → camera 的旋轉
-        D = V - Cc[fi]
+        R2 = Rcam[fi] @ Ra.T
+        D = P - Cc[fi]
         dist = np.linalg.norm(D, axis=1)
         Xc = D @ R2.T
         z = Xc[:, 2]
-        u = fx * Xc[:, 0] / np.maximum(z, 1e-6) + cx
-        v = fy * Xc[:, 1] / np.maximum(z, 1e-6) + cy
+        zs = np.maximum(z, 1e-6)
+        u = fx * Xc[:, 0] / zs + cx
+        v = fy * Xc[:, 1] / zs + cy
         cosv = np.einsum('ij,ij->i', N, -D) / np.maximum(dist, 1e-9)
         ok = (z > 0) & (u >= 0) & (u <= W0 - 1) & (v >= 0) & (v <= H0 - 1) & (cosv > min_cos)
         if masks is not None:
@@ -267,27 +273,99 @@ def color_from_frames(mesh, vidx, frame_paths, masks, intrinsic, Rcam, Ra, Cc, s
         dirs = D[idx] / dist[idx, None]
         rays = np.hstack([np.broadcast_to(Cc[fi], (len(idx), 3)), dirs]).astype(np.float32)
         t = scene.cast_rays(o3d.core.Tensor(rays))['t_hit'].numpy()
-        vis = t > dist[idx] - 0.08
-        idx = idx[vis]
+        idx = idx[t > dist[idx] - eps]
         if len(idx) == 0:
             continue
-        n = len(idx); w_ = int(np.ceil(n / 4096)) * 4096
+        m_ = len(idx); w_ = int(np.ceil(m_ / 4096)) * 4096
         mu = np.zeros(w_, np.float32); mv = np.zeros(w_, np.float32)
-        mu[:n], mv[:n] = u[idx], v[idx]
-        col = cv2.remap(img, mu.reshape(-1, 4096), mv.reshape(-1, 4096), cv2.INTER_LINEAR).reshape(-1, 3)[:n]
+        mu[:m_], mv[:m_] = u[idx], v[idx]
+        col = cv2.remap(img, mu.reshape(-1, 4096), mv.reshape(-1, 4096), cv2.INTER_LINEAR).reshape(-1, 3)[:m_]
         w = (cosv[idx] ** 2 / dist[idx] * sharp[fi]).astype(np.float32)
-        # 插入 top-k
         allw = np.concatenate([best_w[idx], w[:, None]], 1)
         allc = np.concatenate([best_c[idx], col[:, None]], 1)
         order = np.argsort(-allw, 1)[:, :topk]
         best_w[idx] = np.take_along_axis(allw, order, 1)
         best_c[idx] = np.take_along_axis(allc, order[..., None], 1)
-    ws = best_w.sum(1)
     out = np.array(fallback, dtype=np.float64)
-    has = ws > 0
-    out[has] = (best_c[has] * best_w[has, :, None]).sum(1) / ws[has, None]
-    print(f"影片取色：{has.mean():.1%} 的小熊頂點有可見視角")
+    has = best_w[:, 0] > 0
+    if has.any():
+        c = best_c[has].copy()
+        c[best_w[has] <= 0] = np.nan
+        out[has] = np.nanmedian(c, axis=1)
+    return out, has
+
+
+def color_from_frames(mesh, vidx, frame_paths, masks, intrinsic, Rcam, Ra, Cc, sx, sy, padL, padT,
+                      sharp, fallback, topk=5, min_cos=0.2):
+    """網格頂點取色（中位數，去反光）"""
+    V = np.asarray(mesh.vertices)[vidx]
+    N = np.asarray(mesh.vertex_normals)[vidx]
+    out, has = project_colors(V, N, mesh, frame_paths, masks, intrinsic, Rcam, Ra, Cc, sx, sy, padL, padT,
+                              sharp, fallback, topk=topk, min_cos=min_cos)
+    print(f"影像取色：{has.mean():.1%} 的頂點有可見視角")
     return out
+
+
+def bake_texture(mesh, color_fn, tex_size=2048, max_faces=200_000):
+    """UV 展開（Open3D UVAtlas）→ 在貼圖上逐像素算出對應的 3D 位置 → 用 color_fn(P, N) 取色。
+    回傳 (頂點, 三角面, uv[0..1，v 向下], 貼圖 uint8, 精簡後的網格)"""
+    import cv2
+    m = o3d.geometry.TriangleMesh(mesh)
+    if len(m.triangles) > max_faces:
+        m = m.simplify_quadric_decimation(max_faces)
+    m.remove_unreferenced_vertices()
+    m.remove_degenerate_triangles()
+    m.compute_vertex_normals()
+    mt = o3d.t.geometry.TriangleMesh.from_legacy(m)
+    mt.compute_uvatlas(size=tex_size, parallel_partitions=4)       # Open3D 內建 UVAtlas 展開
+    TUV = mt.triangle.texture_uvs.numpy().astype(np.float64)        # (面數, 3, 2)
+    V = np.asarray(m.vertices); F = np.asarray(m.triangles)
+    corner_v = F.reshape(-1)
+    corner_uv = TUV.reshape(-1, 2)
+    key = np.c_[corner_v, np.round(corner_uv * 1e6)].astype(np.int64)
+    _, first, inv = np.unique(key, axis=0, return_index=True, return_inverse=True)
+    V2 = V[corner_v[first]]
+    N2 = np.asarray(m.vertex_normals)[corner_v[first]]
+    UV = corner_uv[first]
+    Fi = inv.reshape(-1, 3)
+    R = tex_size
+    tri_id = np.full((R, R), -1, np.int32)
+    pts = np.round(UV[Fi] * R * 16).astype(np.int32)
+    for t in range(len(Fi)):
+        cv2.fillConvexPoly(tri_id, pts[t], int(t), shift=4)
+    ys, xs = np.nonzero(tri_id >= 0)
+    tid = tri_id[ys, xs]
+    p = np.stack([(xs + 0.5) / R, (ys + 0.5) / R], 1)
+    a, b, c = UV[Fi[tid, 0]], UV[Fi[tid, 1]], UV[Fi[tid, 2]]
+    v0, v1, v2 = b - a, c - a, p - a
+    d00 = (v0 * v0).sum(1); d01 = (v0 * v1).sum(1); d11 = (v1 * v1).sum(1)
+    d20 = (v2 * v0).sum(1); d21 = (v2 * v1).sum(1)
+    den = d00 * d11 - d01 * d01
+    den = np.where(np.abs(den) < 1e-20, 1e-20, den)
+    bv = (d11 * d20 - d01 * d21) / den
+    bw = (d00 * d21 - d01 * d20) / den
+    bu = 1 - bv - bw
+    bary = np.clip(np.stack([bu, bv, bw], 1), 0, 1)
+    bary /= np.maximum(bary.sum(1, keepdims=True), 1e-9)
+    P = (V2[Fi[tid]] * bary[..., None]).sum(1)
+    Nn = (N2[Fi[tid]] * bary[..., None]).sum(1)
+    Nn /= np.maximum(np.linalg.norm(Nn, axis=1, keepdims=True), 1e-9)
+    cols = color_fn(P, Nn)
+    tex = np.zeros((R, R, 3), np.float32)
+    tex[ys, xs] = cols
+    filled = (tri_id >= 0).astype(np.uint8)
+    k3 = np.ones((3, 3), np.uint8)
+    for _ in range(8):                                     # 往外擴幾圈，避免貼圖接縫露出黑邊
+        grown = cv2.dilate(filled, k3)
+        ring = (grown > 0) & (filled == 0)
+        if not ring.any():
+            break
+        blur = cv2.blur(tex * filled[..., None], (3, 3))
+        cnt = cv2.blur(filled.astype(np.float32), (3, 3))
+        tex[ring] = blur[ring] / np.maximum(cnt[ring, None], 1e-6)
+        filled = grown
+    tex8 = (np.clip(tex, 0, 1) * 255).astype(np.uint8)
+    return V2, Fi.astype(np.int32), UV.astype(np.float32), tex8, m
 
 
 def voxel_solid(mesh, vox, close_iters=2, base=None, sink=0.15, min_comp=0.05, max_voxels=40e6, clip_lo=None, clip_hi=None,
@@ -619,6 +697,31 @@ def icp_refine_batches(ext, Ks, depth, conf, mask, batch_of, B):
     return ext
 
 
+def tsdf_fuse(frames, extrinsic, P_ref):
+    """TSDF 融合：在 3D 格子中把所有影格看到的深度做加權平均，隨機雜訊會被大幅抵銷。
+    （Open3D 0.20 的 ScalableTSDFVolume 對浮點深度圖有問題，這裡用 UniformTSDFVolume）"""
+    lo, hi = np.percentile(P_ref, 1, 0), np.percentile(P_ref, 99, 0)
+    size = float((hi - lo).max())
+    center = (lo + hi) / 2
+    length = size * 1.3 + 0.02
+    res = int(np.clip(length / (size / 220), 128, TSDF_MAX_RES))
+    vox = length / res
+    trunc = float(np.clip(0.04 * size, 4 * vox, 0.012))
+    vol = o3d.pipelines.integration.UniformTSDFVolume(
+        length=length, resolution=res, sdf_trunc=trunc,
+        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
+        origin=(center - length / 2).reshape(3, 1))
+    for fi, d, (fx, fy, cx, cy), col in frames:
+        H, W = d.shape
+        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            o3d.geometry.Image(np.ascontiguousarray(col)), o3d.geometry.Image(np.ascontiguousarray(d)),
+            depth_scale=1.0, depth_trunc=10.0, convert_rgb_to_intensity=False)
+        E = np.eye(4); E[:3, :4] = extrinsic[fi]
+        vol.integrate(rgbd, o3d.camera.PinholeCameraIntrinsic(W, H, float(fx), float(fy), float(cx), float(cy)), E)
+    pc = vol.extract_point_cloud()
+    return np.asarray(pc.points), np.asarray(pc.colors), vox
+
+
 def consistency_filter(P, F, extrinsic, intrinsic, depth, frame_ok, box, tol=0.025, min_support=2):
     """多視角一致性：點要被其他至少 min_support 個視角看到「同一個深度」才保留；
     若點出現在其他相機看到的表面前方很多（重影），就剔除。"""
@@ -786,6 +889,7 @@ def main():
     # 高解析點（對齊回第一次推論的相機）
     uu, vv = np.meshgrid(np.arange(518), np.arange(518))
     hp, hc, hf, ratios = [], [], [], []
+    tsdf_in = []
     for j, fi in enumerate(hr_fids):
         x0, y0, side = crop_info[fi]; s_c = 518 / side
         uo = (uu + 0.5) / s_c - 0.5 + x0; vo = (vv + 0.5) / s_c - 0.5 + y0
@@ -810,6 +914,8 @@ def main():
         Xc = np.stack([(uu[ok] - cxc) * z_ / fxc, (vv[ok] - cyc) * z_ / fyc, z_], 1)
         hp.append((Xc - extrinsic[fi][:, 3]) @ extrinsic[fi][:, :3])
         hc.append(np.clip(v2["imgs"][j][ok], 0, 1)); hf.append(np.full(len(z_), fi))
+        tsdf_in.append((fi, np.where(ok, d2a, 0).astype(np.float32), (fxc, fyc, cxc, cyc),
+                        (np.clip(v2["imgs"][j], 0, 1) * 255).astype(np.uint8)))
     if hp:
         P_obj0 = np.concatenate(hp).astype(np.float64)
         COL_obj = np.concatenate(hc).astype(np.float64)
@@ -824,6 +930,24 @@ def main():
         WARN.append("多視角一致性過低，可能是拍攝太快或光線太暗")
     else:
         P_obj0, COL_obj, FID_obj = P_obj0[keepc], COL_obj[keepc], FID_obj[keepc]
+    src_P, src_F = P_obj0, FID_obj                       # 用原始點的來源影格決定法向量朝向
+    tsdf_used = False
+    if USE_TSDF and len(tsdf_in) >= 8:
+        try:
+            Pt, Ct, tvox = tsdf_fuse(tsdf_in, extrinsic, P_obj0)
+            if len(Pt) > 5000:
+                sub = np.random.default_rng(1).choice(len(src_P), min(len(src_P), 2_000_000), replace=False)
+                src_P, src_F = src_P[sub], src_F[sub]
+                P_obj0, COL_obj = Pt, Ct
+                FID_obj = np.zeros(len(Pt), int)
+                tsdf_used = True
+                log(f"TSDF 融合：{len(Pt):,} 點（格子 {tvox*1000:.2f} mm）")
+            else:
+                log("TSDF 點數不足"); WARN.append("TSDF 融合點數不足，改用原本的點雲")
+        except Exception as e:
+            log("TSDF 失敗：", e)
+            WARN.append("TSDF 融合失敗，改用原本的點雲")
+    del tsdf_in
     log(f"物體點 {len(P_obj0):,}，背景點 {len(P_bg0):,}")
 
     # ---- 5. 用 ARKit 相機位置換算真實尺寸（公尺）與重力方向（相似轉換已在前面算好）----
@@ -849,6 +973,7 @@ def main():
     b_al = Ra2 @ (100.0 * M @ t1 - o2)
     to_al = lambda P: k_al * P @ A.T + b_al
     Pc_b, Pc_g, Cc = to_al(P_obj0), to_al(P_bg0), to_al(Ccam)
+    Pc_src = to_al(src_P)
     del P_obj0, P_bg0
 
     try:
@@ -857,16 +982,48 @@ def main():
         log("相機診斷圖失敗：", e)
 
     # ---- 6. 網格 ----
-    mesh, bp, info, vox = build_mesh(Pc_b, COL_obj, FID_obj, Pc_g, COL_bg, Cc, U, has_table)
+    mesh, bp, info, vox = build_mesh(Pc_b, COL_obj, FID_obj, Pc_g, COL_bg, Cc, U, has_table, Pc_src, src_F)
     is_obj = np.asarray(mesh.vertices)[:, 2] > 1.5 * vox
     cols = np.asarray(mesh.vertex_colors).copy()
     cols[is_obj] = color_from_frames(mesh, np.nonzero(is_obj)[0], frame_paths, MASKS, intrinsic, Rcam, A,
                                      Cc, sx, sy, padL, padT, sc[pick], cols[is_obj])
     mesh.vertex_colors = o3d.utility.Vector3dVector(np.clip(cols, 0, 1))
-    log("上色完成")
+    log("頂點上色完成")
 
-    # ---- 7. 匯出 ----
-    export_all(mesh)
+    # ---- 7. 貼圖 ----
+    tex_pack = None
+    tm_ = np.ones(len(Pc_g), bool) if info.get("has_base") else np.zeros(len(Pc_g), bool)
+    tm_ &= (np.abs(Pc_g[:, 2]) < 0.3 * U) & (np.linalg.norm(Pc_g[:, :2] - np.median(bp[:, :2], 0), axis=1) < 3 * np.ptp(bp[:, :2], axis=0).max() + 5)
+    table_xy, table_col = Pc_g[tm_][:, :2].copy(), COL_bg[tm_].copy()
+    # 釋放大型陣列，留記憶體給貼圖步驟
+    del Pc_g, COL_bg, Pc_b, v2, conf, imgs, depth, BMASK, BDIL, valid, bg_px, obj_px
+    import gc; gc.collect()
+    try:
+        tree_g = cKDTree(table_xy) if len(table_xy) > 50 else None
+        base_side = np.median(table_col, 0) * 0.85 if len(table_col) > 50 else np.full(3, 0.6)
+
+        def color_fn(P, Nn):
+            out = np.zeros((len(P), 3))
+            ob = P[:, 2] > 1.5 * vox
+            if ob.any():
+                fb = np.asarray(mesh.vertex_colors)[cKDTree(np.asarray(mesh.vertices)).query(P[ob], k=1)[1]]
+                out[ob], _ = project_colors(P[ob], Nn[ob], mesh, frame_paths, MASKS, intrinsic, Rcam, A,
+                                            Cc, sx, sy, padL, padT, sc[pick], fb)
+            top = ~ob & (P[:, 2] > -0.75 * vox)
+            if tree_g is not None and top.any():
+                out[top] = table_col[tree_g.query(P[top][:, :2], k=8)[1]].mean(1)
+            out[~ob & ~top] = base_side
+            return out
+
+        tex_pack = bake_texture(mesh, color_fn, tex_size=TEXTURE_SIZE)
+        log(f"貼圖完成（{TEXTURE_SIZE}×{TEXTURE_SIZE}，{len(tex_pack[1]):,} 面）")
+    except Exception as e:
+        traceback.print_exc()
+        WARN.append(f"貼圖失敗，改用頂點顏色（{str(e)[:80]}）")
+
+    # ---- 8. 匯出 ----
+    export_all(mesh, tex_pack)
+    info.update(tsdf=tsdf_used, textured=tex_pack is not None)
     ext = bp.max(0) - bp.min(0)
     info.update(target_method=target_method, prompt_frames=len(prompts), bad_pose_frames=len(bad_pose),
                 batches=int(NB), smooth_level=SMOOTH_LEVEL,
@@ -877,7 +1034,7 @@ def main():
     log("全部完成")
 
 
-def build_mesh(Pc_b, COL_b, FID_b, Pc_g, COL_g, Cc, U, has_table):
+def build_mesh(Pc_b, COL_b, FID_b, Pc_g, COL_g, Cc, U, has_table, src_P=None, src_F=None):
     T_BASE = max(0.5 * U, 0.2)
     SINK = min(0.15 * U, T_BASE / 2)
     VOX = max(0.05, 0.05 * U)
@@ -895,8 +1052,10 @@ def build_mesh(Pc_b, COL_b, FID_b, Pc_g, COL_g, Cc, U, has_table):
     pcd = pcd.voxel_down_sample(VOX)
     pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=30, std_ratio=1.5)
     pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=max(0.4 * U, 6 * VOX), max_nn=40))
-    sub_ = np.random.default_rng(0).choice(len(P_), min(len(P_), 2_000_000), replace=False)
-    pcd = orient_normals_by_source_cam(pcd, P_[sub_], Cc[F_id[sub_]])
+    if src_P is None:
+        sub_ = np.random.default_rng(0).choice(len(P_), min(len(P_), 2_000_000), replace=False)
+        src_P, src_F = P_[sub_], F_id[sub_]
+    pcd = orient_normals_by_source_cam(pcd, src_P, Cc[src_F])
     bp = np.asarray(pcd.points)
     log(f"物體點雲 {len(bp):,} 點")
 
@@ -949,19 +1108,40 @@ def build_mesh(Pc_b, COL_b, FID_b, Pc_g, COL_g, Cc, U, has_table):
     return mesh, bp, info, vox
 
 
-def export_all(mesh):
+def export_all(mesh, tex_pack=None):
     import trimesh
+    from PIL import Image as PILImage
     V = np.asarray(mesh.vertices); F_ = np.asarray(mesh.triangles)
     VC = (np.clip(np.asarray(mesh.vertex_colors), 0, 1) * 255).astype(np.uint8)
     trimesh.Trimesh(V * 10, F_, vertex_colors=VC, process=False).export(f"{WORK}/model_mm.ply")
     trimesh.Trimesh(V * 10, F_, process=False).export(f"{WORK}/model_mm.stl")
-    Vg = V * 0.01
-    trimesh.Trimesh(np.stack([Vg[:, 0], Vg[:, 2], -Vg[:, 1]], 1), F_, vertex_colors=VC, process=False).export(f"{WORK}/model.glb")
-    # App 預覽用的精簡網格（公尺、y 軸朝上）
-    prev = mesh.simplify_quadric_decimation(150_000) if len(F_) > 150_000 else mesh
-    prev.compute_vertex_normals()
-    write_preview(prev, f"{WORK}/preview.bin")
+    yup = lambda X: np.stack([X[:, 0], X[:, 2], -X[:, 1]], 1)
+    if tex_pack is not None:
+        V2, Fi, UV, tex8, _ = tex_pack
+        img = PILImage.fromarray(tex8)
+        img.save(f"{WORK}/preview_tex.jpg", quality=90)
+        vis = trimesh.visual.TextureVisuals(uv=np.c_[UV[:, 0], 1 - UV[:, 1]], image=img)   # trimesh 的 uv 以左下為原點
+        trimesh.Trimesh(yup(V2 * 0.01), Fi, visual=vis, process=False).export(f"{WORK}/model.glb")
+        mt = trimesh.Trimesh(V2, Fi, process=False)
+        write_preview_textured(V2, Fi, UV, np.asarray(mt.vertex_normals), f"{WORK}/preview.bin")
+    else:
+        trimesh.Trimesh(yup(V * 0.01), F_, vertex_colors=VC, process=False).export(f"{WORK}/model.glb")
+        prev = mesh.simplify_quadric_decimation(150_000) if len(F_) > 150_000 else mesh
+        prev.compute_vertex_normals()
+        write_preview(prev, f"{WORK}/preview.bin")
     log("匯出完成：", sorted(os.listdir(WORK)))
+
+
+def write_preview_textured(V, F_, UV, N, path):
+    """格式：'O3DT' + u32 頂點數 + u32 三角面數 + f32 位置 + f32 法向量 + f32 uv（v 向下）+ u32 索引；貼圖為 preview_tex.jpg"""
+    yup = lambda X: np.stack([X[:, 0], X[:, 2], -X[:, 1]], 1)
+    Vy = yup(np.asarray(V) * 0.01).astype("<f4")
+    Ny = yup(np.asarray(N)).astype("<f4")
+    with open(path, "wb") as f:
+        f.write(b"O3DT")
+        f.write(np.array([len(Vy), len(F_)], "<u4").tobytes())
+        for arr in (Vy, Ny, np.asarray(UV, "<f4"), np.asarray(F_, "<u4")):
+            f.write(np.ascontiguousarray(arr).tobytes())
 
 
 def write_preview(m, path):

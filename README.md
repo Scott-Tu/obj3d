@@ -78,3 +78,10 @@ iOS App 必須在 Mac 上編譯，這裡借用 GitHub 免費提供的雲端 Mac�
 - **反光、透明、很細的物體**（玻璃、鏡面、鐵絲）不容易重建。
 
 每次生成都會更新你 Kaggle 帳號下的私人資料集 `obj3d-capture-data` 與私人程式 `obj3d-runner`，並使用 Kaggle 每週的免費 GPU 配額。
+
+
+## 六、用 Claude Code 自動更新（選用）
+
+專案內附 `.claude/skills/update-app/`。在專案資料夾開啟 Claude Code 後輸入 `/update-app`，
+它會自動：找到「下載」裡最新的 obj3d.zip → 套用 → Commit、Push → 等 GitHub 編譯 → 下載 Obj3D.ipa 並開啟 Sideloadly。
+最後用 Sideloadly 安裝到 iPhone 仍需手動（需要你的 Apple ID）。

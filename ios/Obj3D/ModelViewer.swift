@@ -25,34 +25,47 @@ struct ModelViewer: UIViewRepresentable {
 }
 
 enum PreviewLoader {
-    /// 格式：'O3DP' + u32 頂點數 + u32 三角面數 + f32 位置 + f32 法向量 + f32 顏色 + u32 索引（單位：公尺，y 軸朝上，桌面 y = 0）
+    /// 兩種格式（單位：公尺，y 軸朝上，桌面 y = 0）：
+    /// 'O3DP'：u32 頂點數、u32 面數、f32 位置、f32 法向量、f32 顏色、u32 索引（頂點顏色）
+    /// 'O3DT'：u32 頂點數、u32 面數、f32 位置、f32 法向量、f32 uv、u32 索引；貼圖為同資料夾的 preview_tex.jpg
     static func load(_ url: URL) -> (SCNScene, SCNNode?) {
         let scene = SCNScene()
         guard let data = try? Data(contentsOf: url), data.count > 12,
-              String(data: data.prefix(4), encoding: .ascii) == "O3DP" else { return (scene, nil) }
+              let magic = String(data: data.prefix(4), encoding: .ascii),
+              magic == "O3DP" || magic == "O3DT" else { return (scene, nil) }
+        let textured = magic == "O3DT"
         let nV = Int(data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 4, as: UInt32.self) })
         let nF = Int(data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 8, as: UInt32.self) })
         let vBytes = nV * 12
         let posOff = 12
         let nrmOff = posOff + vBytes
-        let colOff = nrmOff + vBytes
-        let idxOff = colOff + vBytes
+        let thirdOff = nrmOff + vBytes                       // 顏色（O3DP）或 uv（O3DT）
+        let thirdBytes = textured ? nV * 8 : vBytes
+        let idxOff = thirdOff + thirdBytes
         let end = idxOff + nF * 12
         guard nV > 0, nF > 0, data.count >= end else { return (scene, nil) }
 
-        func source(_ off: Int, _ semantic: SCNGeometrySource.Semantic) -> SCNGeometrySource {
-            SCNGeometrySource(data: data.subdata(in: off..<(off + vBytes)), semantic: semantic,
-                              vectorCount: nV, usesFloatComponents: true, componentsPerVector: 3,
-                              bytesPerComponent: 4, dataOffset: 0, dataStride: 12)
+        func source(_ off: Int, _ semantic: SCNGeometrySource.Semantic, _ comps: Int) -> SCNGeometrySource {
+            SCNGeometrySource(data: data.subdata(in: off..<(off + nV * comps * 4)), semantic: semantic,
+                              vectorCount: nV, usesFloatComponents: true, componentsPerVector: comps,
+                              bytesPerComponent: 4, dataOffset: 0, dataStride: comps * 4)
         }
         let element = SCNGeometryElement(data: data.subdata(in: idxOff..<end), primitiveType: .triangles,
                                          primitiveCount: nF, bytesPerIndex: 4)
-        let geometry = SCNGeometry(sources: [source(posOff, .vertex), source(nrmOff, .normal), source(colOff, .color)],
+        let third = textured ? source(thirdOff, .texcoord, 2) : source(thirdOff, .color, 3)
+        let geometry = SCNGeometry(sources: [source(posOff, .vertex, 3), source(nrmOff, .normal, 3), third],
                                    elements: [element])
         let material = SCNMaterial()
-        material.diffuse.contents = UIColor.white
         material.isDoubleSided = true
-        material.lightingModel = .blinn
+        if textured,
+           let img = UIImage(contentsOfFile: url.deletingLastPathComponent().appendingPathComponent("preview_tex.jpg").path) {
+            material.diffuse.contents = img
+            material.diffuse.mipFilter = .linear
+            material.lightingModel = .lambert
+        } else {
+            material.diffuse.contents = UIColor.white
+            material.lightingModel = .blinn
+        }
         geometry.materials = [material]
 
         let node = SCNNode(geometry: geometry)
