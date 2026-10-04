@@ -25,6 +25,8 @@ struct ResultMeta: Codable {
     let runner_version: String?
     let tsdf: Bool?
     let textured: Bool?
+    let params_summary: String?
+    let smooth_level: String?
 }
 
 struct JobResult {
@@ -226,9 +228,20 @@ final class JobManager: ObservableObject {
               let template = try? String(contentsOf: url, encoding: .utf8) else {
             throw KaggleError(message: "App 內找不到 runner.py")
         }
-        let smooth = UserDefaults.standard.string(forKey: "smoothLevel") ?? "medium"
+        let d = UserDefaults.standard
+        let smooth = d.string(forKey: "smoothLevel") ?? "medium"
+        let params: [String: Any] = [
+            "solid_voxel_mm": d.double(forKey: "devSolidMM"),
+            "tsdf_trunc_mm": d.double(forKey: "devTruncMM"),
+            "batches": d.integer(forKey: "devBatches"),
+            "use_tsdf": d.object(forKey: "devUseTSDF") as? Bool ?? true,
+            "use_texture": d.object(forKey: "devUseTexture") as? Bool ?? true,
+        ]
+        let paramsJSON = (try? JSONSerialization.data(withJSONObject: params))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
         let script = template.replacingOccurrences(of: "__JOB_ID__", with: jobId)
             .replacingOccurrences(of: "__SMOOTH__", with: smooth)
+            .replacingOccurrences(of: "__PARAMS__", with: paramsJSON)
         let shape = UserDefaults.standard.string(forKey: "machineShape") ?? "NvidiaTeslaT4"
         status = "啟動 Kaggle 運算…"
         try await withRetry("啟動運算") {
@@ -325,6 +338,7 @@ final class JobManager: ObservableObject {
         if r.meta.tsdf == true { feats.append("TSDF") }
         if r.meta.textured == true { feats.append("貼圖") }
         lines.append("運算程式：\(r.meta.runner_version ?? "舊版（無版本資訊）")" + (feats.isEmpty ? "" : "（\(feats.joined(separator: "、"))）"))
+        if let p = r.meta.params_summary { lines.append("參數：\(p)、平滑度 \(r.meta.smooth_level ?? "?")") }
         if let w = r.meta.warnings, !w.isEmpty { lines.append("注意：" + w.joined(separator: "；")) }
         detail = lines.joined(separator: "\n")
     }

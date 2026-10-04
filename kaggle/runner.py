@@ -5,7 +5,7 @@
 #        preview.bin（App 預覽用）、result_meta.json
 # =====================================================================
 JOB_ID = "__JOB_ID__"
-RUNNER_VERSION = "2026.10.04-tsdf-texture"   # 每次修改運算程式時更新
+RUNNER_VERSION = "2026.10.05-devparams"   # 每次修改運算程式時更新
 SMOOTH_LEVEL = "__SMOOTH__"      # low / medium / high（由 App 設定）
 
 import os, sys, json, time, glob, shutil, subprocess, zipfile, traceback
@@ -23,6 +23,20 @@ MAX_BATCHES = 3                  # T4 一次約 50 張，分 3 批 → 最多約
 USE_TSDF = True                  # 深度圖用 TSDF 融合（平均掉雜訊，表面更平滑）
 TEXTURE_SIZE = 2048              # 貼圖解析度
 TSDF_MAX_RES = 384               # TSDF 格子數上限（每邊）
+
+# ---- App「開發者參數」：由 App 填入 JSON；0 或缺少 = 自動 ----
+PARAMS_JSON = r"""__PARAMS__"""
+try:
+    PARAMS = json.loads(PARAMS_JSON) if not PARAMS_JSON.startswith("__") else {}
+except Exception:
+    PARAMS = {}
+DEV_SOLID_MM = float(PARAMS.get("solid_voxel_mm") or 0)      # 封閉實體的體素大小（mm）
+DEV_TRUNC_MM = float(PARAMS.get("tsdf_trunc_mm") or 0)       # TSDF 截斷距離（mm）
+if int(PARAMS.get("batches") or 0) > 0:
+    MAX_BATCHES = int(PARAMS["batches"])
+if "use_tsdf" in PARAMS:
+    USE_TSDF = bool(PARAMS["use_tsdf"])
+USE_TEXTURE = bool(PARAMS.get("use_texture", True))
 CONF_DROP_PERCENT = 40
 HR_TOL = 0.04
 MASK_ERODE_PX = 4
@@ -709,6 +723,9 @@ def tsdf_fuse(frames, extrinsic, P_ref):
     res = int(np.clip(length / (size / 220), 128, TSDF_MAX_RES))
     vox = length / res
     trunc = float(np.clip(0.04 * size, 4 * vox, 0.012))
+    if DEV_TRUNC_MM > 0:
+        trunc = max(DEV_TRUNC_MM / 1000.0, 2 * vox)
+    log(f"TSDF 截斷距離 {trunc*1000:.1f} mm")
     vol = o3d.pipelines.integration.UniformTSDFVolume(
         length=length, resolution=res, sdf_trunc=trunc,
         color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
@@ -1017,6 +1034,8 @@ def main():
             out[~ob & ~top] = base_side
             return out
 
+        if not USE_TEXTURE:
+            raise RuntimeError("已在開發者參數中關閉貼圖")
         tex_pack = bake_texture(mesh, color_fn, tex_size=TEXTURE_SIZE)
         log(f"貼圖完成（{TEXTURE_SIZE}×{TEXTURE_SIZE}，{len(tex_pack[1]):,} 面）")
     except Exception as e:
@@ -1025,7 +1044,9 @@ def main():
 
     # ---- 8. 匯出 ----
     export_all(mesh, tex_pack)
-    info.update(tsdf=tsdf_used, textured=tex_pack is not None)
+    info.update(tsdf=tsdf_used, textured=tex_pack is not None,
+                params_summary=f"實體 {DEV_SOLID_MM or '自動'} mm、截斷 {DEV_TRUNC_MM or '自動'} mm、"
+                               f"批次 {MAX_BATCHES}、TSDF {'開' if USE_TSDF else '關'}、貼圖 {'開' if USE_TEXTURE else '關'}")
     ext = bp.max(0) - bp.min(0)
     info.update(target_method=target_method, prompt_frames=len(prompts), bad_pose_frames=len(bad_pose),
                 batches=int(NB), smooth_level=SMOOTH_LEVEL,
@@ -1080,7 +1101,8 @@ def build_mesh(Pc_b, COL_b, FID_b, Pc_g, COL_g, Cc, U, has_table, src_P=None, sr
     tm = (np.abs(Pc_g[:, 2]) < 0.3 * U) & (np.linalg.norm(Pc_g[:, :2] - cxy, axis=1) < R_base + 2 * U)
     use_base = has_table and tm.sum() > 200
     margin = 0.3 * U
-    mesh, vox = voxel_solid(pm, SOLID_VOXEL * U, base=(cxy, R_base, T_BASE) if use_base else None, sink=SINK,
+    solid_target = DEV_SOLID_MM / 10.0 if DEV_SOLID_MM > 0 else SOLID_VOXEL * U
+    mesh, vox = voxel_solid(pm, solid_target, base=(cxy, R_base, T_BASE) if use_base else None, sink=SINK,
                             clip_lo=bp.min(0) - margin, clip_hi=bp.max(0) + margin,
                             blur=SMOOTH_BLUR, taubin=SMOOTH_TAUBIN)
     if SMOOTH_ITERS > 0:
