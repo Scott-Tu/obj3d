@@ -19,9 +19,11 @@ struct CaptureView: View {
     @StateObject private var capture = CaptureManager()
     @Environment(\.dismiss) private var dismiss
     @State private var finishing = false
+    var mode: String
     var onFinish: (URL, String, Int) -> Void
 
-    init(onFinish: @escaping (URL, String, Int) -> Void) {
+    init(mode: String, onFinish: @escaping (URL, String, Int) -> Void) {
+        self.mode = mode
         self.onFinish = onFinish
     }
 
@@ -55,7 +57,9 @@ struct CaptureView: View {
                     .padding(10)
                     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
                 Spacer()
-                Text("讓物體一直在十字中央，慢慢繞一整圈，\n再從斜上方繞一圈（約 40~90 秒）")
+                Text(mode == "orbit"
+                     ? "讓物體一直在十字中央，慢慢繞一整圈，\n再從斜上方繞一圈（約 40~90 秒）"
+                     : "比例尺放在轉盤上、物體旁邊，跟著一起轉；\n手機盡量不動，慢慢轉一圈以上（約 40~90 秒）")
                     .font(.footnote)
                     .multilineTextAlignment(.center)
                     .padding(10)
@@ -90,7 +94,7 @@ struct CaptureView: View {
                 dismiss()
             }
         } else {
-            capture.beginRecording()
+            capture.beginRecording(mode: mode)
         }
     }
 }

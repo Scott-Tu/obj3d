@@ -23,7 +23,7 @@ struct CaptureLibraryView: View {
                             }
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(c.date.formatted(date: .abbreviated, time: .shortened)).font(.headline)
-                                Text("\(c.frames) 張影格" + (job.captureURL == c.url ? "（目前使用中）" : ""))
+                                Text((c.mode == "turntable" ? "物體旋轉・" : "手機繞物體・") + "\(c.frames) 張影格" + (job.captureURL == c.url ? "（目前使用中）" : ""))
                                     .font(.footnote).foregroundColor(.secondary)
                             }
                         }

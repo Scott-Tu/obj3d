@@ -5,6 +5,7 @@ struct SettingsView: View {
     @AppStorage("machineShape") private var machineShape = "NvidiaTeslaT4"
     @AppStorage("smoothLevel") private var smoothLevel = "medium"
     @AppStorage("saveVideoToPhotos") private var saveVideoToPhotos = true
+    @AppStorage("scaleLengthCM") private var scaleLengthCM = 15.0
     @State private var apiKey = Keychain.get("kaggleKey") ?? ""
     @State private var testing = false
     @State private var testResult = ""
@@ -40,6 +41,17 @@ struct SettingsView: View {
             Section(header: Text("錄影"),
                     footer: Text("錄影時同時錄一段一般影片（每秒 30 張）存到「照片」App，第一次會詢問權限。建模用的影格仍另外存在 App 裡。")) {
                 Toggle("同時存影片到「照片」", isOn: $saveVideoToPhotos)
+            }
+
+            Section(header: Text("物體旋轉模式"),
+                    footer: Text("比例尺要放在轉盤上、物體旁邊，跟著物體一起轉，且兩端在畫面中清楚可見。長度請量實際的兩端距離。")) {
+                Stepper(value: $scaleLengthCM, in: 3...60, step: 0.5) {
+                    HStack {
+                        Text("比例尺長度")
+                        Spacer()
+                        Text(String(format: "%.1f cm", scaleLengthCM)).foregroundColor(.secondary)
+                    }
+                }
             }
 
             Section(header: Text("模型"),

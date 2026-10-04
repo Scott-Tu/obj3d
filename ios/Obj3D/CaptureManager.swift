@@ -17,12 +17,27 @@ struct CapturedFrame: Codable {
     let tracking: String
 }
 
+struct ScaleMark: Codable {
+    var frame: String          // 例如 "frames/00012.jpg"
+    var p1: [Double]           // 原始影像像素座標
+    var p2: [Double]
+}
+
+struct ObjectPoint: Codable {
+    var frame: String
+    var p: [Double]
+}
+
 struct CaptureMeta: Codable {
     var jobId: String
     var imageWidth: Int
     var imageHeight: Int
     var orientation: String
     var frames: [CapturedFrame]
+    var mode: String?                    // "orbit"（手機繞物體）或 "turntable"（物體旋轉）
+    var scale_length_cm: Double?
+    var scale_marks: [ScaleMark]?
+    var object_point: ObjectPoint?
 }
 
 /// 錄影：每 0.5 秒存一張影格，同時記錄 ARKit 算出的手機位置（用來換算真實尺寸）
@@ -78,7 +93,10 @@ final class CaptureManager: NSObject, ObservableObject, ARSessionDelegate {
         session.pause()
     }
 
-    func beginRecording() {
+    private(set) var mode = "orbit"
+
+    func beginRecording(mode: String) {
+        self.mode = mode
         let jobId = String(UUID().uuidString.prefix(8)).lowercased()
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let dir = docs.appendingPathComponent("captures/capture_\(jobId)", isDirectory: true)
@@ -87,7 +105,8 @@ final class CaptureManager: NSObject, ObservableObject, ARSessionDelegate {
         saveQueue.sync {
             self.captureDir = dir
             self.meta = CaptureMeta(jobId: jobId, imageWidth: 0, imageHeight: 0,
-                                    orientation: "portrait", frames: [])
+                                    orientation: "portrait", frames: [], mode: mode,
+                                    scale_length_cm: nil, scale_marks: nil, object_point: nil)
         }
         frameCount = 0
         lastSavedTime = 0
@@ -125,7 +144,9 @@ final class CaptureManager: NSObject, ObservableObject, ARSessionDelegate {
         updateTracking(frame.camera.trackingState)
         guard isRecording else { return }
         if saveVideoEnabled { appendVideoFrame(frame) }
-        guard case .normal = frame.camera.trackingState else { return }
+        if mode == "orbit" {                              // 手機繞物體：需要追蹤正常（用來算位置與尺寸）
+            guard case .normal = frame.camera.trackingState else { return }
+        }
         guard frame.timestamp - lastSavedTime >= interval, inFlight < 3 else { return }
         lastSavedTime = frame.timestamp
         inFlight += 1
@@ -255,7 +276,8 @@ final class CaptureManager: NSObject, ObservableObject, ARSessionDelegate {
         switch state {
         case .normal:
             good = true
-            text = isRecording ? "錄製中：慢慢繞著物體走" : "追蹤良好，可以開始錄影"
+            text = isRecording ? (mode == "orbit" ? "錄製中：慢慢繞著物體走" : "錄製中：手機盡量不動，慢慢旋轉物體")
+                               : "追蹤良好，可以開始錄影"
         case .notAvailable:
             text = "追蹤無法使用"
         case .limited(let reason):

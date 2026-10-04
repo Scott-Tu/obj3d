@@ -5,7 +5,7 @@
 #        preview.bin（App 預覽用）、result_meta.json
 # =====================================================================
 JOB_ID = "__JOB_ID__"
-RUNNER_VERSION = "2026.10.05-params2"   # 每次修改運算程式時更新
+RUNNER_VERSION = "2026.10.06-turntable"   # 每次修改運算程式時更新
 SMOOTH_LEVEL = "__SMOOTH__"      # low / medium / high（由 App 設定）
 
 import os, sys, json, time, glob, shutil, subprocess, zipfile, traceback
@@ -667,6 +667,142 @@ def gpu_memory_gb():
 # =====================================================================
 #  主流程
 # =====================================================================
+def run_sam_objects(sel_dir, n, W0, H0, objs):
+    """多物體追蹤：objs = {物體編號: {影格: [(x, y), ...]}}，回傳 {物體編號: 遮罩 (n,H0,W0)}"""
+    import torch
+    from sam2.sam2_video_predictor import SAM2VideoPredictor
+    pred = SAM2VideoPredictor.from_pretrained("facebook/sam2.1-hiera-large")
+    bf16 = torch.cuda.get_device_capability()[0] >= 8
+    masks = {int(o): np.zeros((n, H0, W0), bool) for o in objs}
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
+        st = pred.init_state(sel_dir, offload_video_to_cpu=True)
+        for oid, frs in objs.items():
+            for fi, pts in frs.items():
+                pred.add_new_points_or_box(st, frame_idx=int(fi), obj_id=int(oid),
+                                           points=np.array(pts, np.float32), labels=np.ones(len(pts), np.int32))
+        for rev in (False, True):
+            for fidx, obj_ids, lg in pred.propagate_in_video(st, reverse=rev):
+                for k, oid in enumerate(obj_ids):
+                    masks[int(oid)][fidx] |= (lg[k, 0] > 0).cpu().numpy()
+    del pred, st
+    torch.cuda.empty_cache()
+    return masks
+
+
+def run_vggt_batches_anchor(paths, n_batch):
+    """沒有 ARKit 軌跡可用時（轉盤模式）的分批推論：每批都包含同一組「錨點影格」，
+    用錨點的相機位置把各批對齊到第一批的座標系。"""
+    n = len(paths)
+    B = int(min(MAX_BATCHES, np.ceil(n / n_batch)))
+    if B <= 1:
+        v = run_vggt(paths, "pad", True)
+        log(f"VGGT（1 批，{n} 張）完成")
+        return (v["extrinsic"].astype(np.float32), v["intrinsic"], v["depth"], v["conf"], v["imgs"],
+                np.zeros(n, int), 1)
+    n_anchor = int(np.clip(n_batch // 5, 6, 12))
+    anchors = sorted(set(np.linspace(0, n - 1, n_anchor).astype(int).tolist()))
+    aset = set(anchors)
+    rest = [i for i in range(n) if i not in aset]
+    per = max(1, n_batch - len(anchors))
+    B = int(min(MAX_BATCHES, np.ceil(len(rest) / per)))
+    groups = [rest[b::B] for b in range(B)]
+    ext = np.zeros((n, 3, 4), np.float32); Ks = np.zeros((n, 3, 3), np.float32)
+    depth = conf = imgs = None
+    batch_of = np.zeros(n, int)
+    ref = None
+    for b, g in enumerate(groups):
+        idx = anchors + g
+        v = run_vggt([paths[i] for i in idx], "pad", True)
+        C, _, _ = cam_centers_dirs(v["extrinsic"])
+        Ca = C[:len(anchors)]
+        if ref is None:
+            ref = Ca.copy(); s, R, t = 1.0, np.eye(3), np.zeros(3)
+        else:
+            s, R, t = umeyama(Ca, ref)
+            res = np.linalg.norm(s * Ca @ R.T + t - ref, axis=1)
+            log(f"第 {b+1} 批錨點對齊殘差（相對單位）中位數 {np.median(res):.4f}")
+        if depth is None:
+            depth = np.zeros((n,) + v["depth"].shape[1:], np.float32)
+            conf = np.zeros_like(depth); imgs = np.zeros((n,) + v["imgs"].shape[1:], np.float32)
+        for k, i in enumerate(idx):
+            if b > 0 and k < len(anchors):
+                continue
+            Rj = v["extrinsic"][k][:, :3].astype(np.float64); tj = v["extrinsic"][k][:, 3].astype(np.float64)
+            Rn = Rj @ R.T
+            ext[i] = np.hstack([Rn, (s * tj - Rn @ t)[:, None]])
+            Ks[i] = v["intrinsic"][k]
+            depth[i] = v["depth"][k] * s; conf[i] = v["conf"][k]; imgs[i] = v["imgs"][k]
+            batch_of[i] = b
+        log(f"VGGT 第 {b+1}/{B} 批（{len(idx)} 張，含 {len(anchors)} 張錨點）完成")
+        del v
+    return ext, Ks, depth, conf, imgs, batch_of, B
+
+
+def ruler_scale(marks_sel, extrinsic, intrinsic, depth, RMASK, sx, sy, padL, padT, L_true_cm):
+    """比例尺：沿著使用者標記的兩端取深度，擬合 3D 直線，再求兩端點在直線上的位置，得到長度（相對單位）。
+    回傳 (每單位幾公尺, 比例尺的 3D 點（世界座標）, 各影格量到的長度)"""
+    Ls, pts_world = [], []
+    for fi, p1, p2 in marks_sel:
+        K = intrinsic[fi].astype(np.float64); Kinv = np.linalg.inv(K)
+        p1 = np.asarray(p1, float); p2 = np.asarray(p2, float)
+        to_proc = lambda q: np.array([(q[0] + 0.5) * sx - 0.5 + padL, (q[1] + 0.5) * sy - 0.5 + padT])
+        H0m, W0m = RMASK[fi].shape
+        P = []
+        for t in np.linspace(0.04, 0.96, 80):
+            q = p1 + (p2 - p1) * t
+            qi = (int(np.clip(round(q[1]), 0, H0m - 1)), int(np.clip(round(q[0]), 0, W0m - 1)))
+            if RMASK[fi].any() and not RMASK[fi][qi]:
+                continue
+            u, v = to_proc(q)
+            ui, vi = int(round(u)), int(round(v))
+            win = depth[fi][max(vi - 1, 0):vi + 2, max(ui - 1, 0):ui + 2]
+            win = win[win > 0]
+            if len(win) == 0:
+                continue
+            P.append(np.median(win) * (Kinv @ np.array([u, v, 1.0])))
+        if len(P) < 12:
+            continue
+        P = np.array(P)
+        for _ in range(2):                                   # 擬合直線並排除離群點
+            c = P.mean(0)
+            dirv = np.linalg.svd(P - c, full_matrices=False)[2][0]
+            res = np.linalg.norm((P - c) - ((P - c) @ dirv)[:, None] * dirv, axis=1)
+            P = P[res <= max(np.percentile(res, 80), 1e-12)]
+        c = P.mean(0)
+        dirv = np.linalg.svd(P - c, full_matrices=False)[2][0]
+
+        def on_line(q):
+            rv = Kinv @ np.array([*to_proc(q), 1.0]); rv /= np.linalg.norm(rv)
+            b_ = dirv @ rv; d_ = dirv @ c; e_ = rv @ c
+            den = 1 - b_ * b_
+            s_ = (b_ * e_ - d_) / den if abs(den) > 1e-9 else 0.0
+            return c + s_ * dirv
+        Ls.append(float(np.linalg.norm(on_line(p1) - on_line(p2))))
+        pts_world.append((P - extrinsic[fi][:, 3]) @ extrinsic[fi][:, :3])
+    if not Ls:
+        raise RuntimeError("找不到比例尺：請確認標記的兩端在比例尺上，而且比例尺放在轉盤上跟著物體一起轉")
+    L_units = float(np.median(Ls))
+    return (L_true_cm / 100.0) / L_units, np.concatenate(pts_world), Ls
+
+
+def gravity_up(T_ar_sel, extrinsic):
+    """轉盤模式的「上方」：用 ARKit 記錄的手機姿態算出每張畫面中重力的方向（物體只繞垂直軸轉，所以重力在物體座標中不變）"""
+    M_ = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1.0]]) @ np.diag([1.0, -1.0, -1.0])   # ARKit 相機 → 直式影像相機
+    g_w = np.array([0, -1.0, 0])
+    downs = []
+    for T, E in zip(T_ar_sel, extrinsic):
+        g_cv = M_ @ (T[:3, :3].T @ g_w)
+        g = E[:, :3].astype(np.float64).T @ g_cv
+        downs.append(g / np.linalg.norm(g))
+    downs = np.array(downs)
+    d = downs.mean(0); d /= np.linalg.norm(d)
+    keep = downs @ d > np.cos(np.radians(20))
+    if keep.sum() >= 3:
+        d = downs[keep].mean(0); d /= np.linalg.norm(d)
+    spread = float(np.degrees(np.arccos(np.clip(downs @ d, -1, 1))).mean())
+    return -d, spread
+
+
 def run_vggt_batches(frame_paths, C_ar, n_batch):
     """分批跑 VGGT（交錯分組），每批各自用 ARKit 軌跡對齊到同一個公尺座標系後合併。"""
     n = len(frame_paths)
@@ -856,9 +992,10 @@ def main():
     paths = [os.path.join(cap_dir, f["file"]) for f in frames]
     T_ar = np.array([np.array(f["transform"], float).reshape(4, 4).T for f in frames])   # column-major
     C_ar_all = T_ar[:, :3, 3]
+    TT = meta.get("mode") == "turntable"                 # 轉盤模式：物體旋轉、手機大致不動
     span = np.ptp(C_ar_all, axis=0).max()
-    if span < 0.15:
-        raise RuntimeError(f"手機移動範圍太小（{span*100:.0f} cm），請繞著物體走一圈")
+    if not TT and span < 0.15:
+        raise RuntimeError(f"手機移動範圍太小（{span*100:.0f} cm），請繞著物體走一圈；如果是旋轉物體的拍法，請在 App 選「物體旋轉」模式")
 
     # ---- 1. 挑影格 ----
     gb = gpu_memory_gb()
@@ -869,6 +1006,13 @@ def main():
     N = min(N, len(paths))
     sc = np.array([sharpness(p) for p in paths])
     pick = [int(b[np.argmax(sc[b])]) for b in np.array_split(np.arange(len(paths)), N) if len(b)]
+    if TT:
+        marks = meta.get("scale_marks") or []
+        objp = meta.get("object_point")
+        if not marks:
+            raise RuntimeError("物體旋轉模式需要先在 App 裡標記比例尺兩端")
+        need = {m["frame"] for m in marks} | ({objp["frame"]} if objp else set())
+        pick = sorted(set(pick) | {i for i, f in enumerate(frames) if f["file"] in need})
     SEL = f"{TMP}/sel"
     shutil.rmtree(SEL, ignore_errors=True); os.makedirs(SEL)
     frame_paths = []
@@ -880,33 +1024,80 @@ def main():
     nw, nh, padL, padT, sx, sy = pad_geometry(W0, H0)
     log(f"影格 {len(paths)} → 選用 {len(pick)}（GPU {gb:.0f} GB），{W0}x{H0}")
 
-    # ---- 2. VGGT 第一次 + SAM 2 ----
-    extrinsic, intrinsic, depth, conf, imgs, batch_of, NB = run_vggt_batches(frame_paths, C_ar, N_batch)
-    log(f"VGGT 第一次完成（{NB} 批，共 {len(frame_paths)} 張）")
-    # 用 ARKit 軌跡檢查 VGGT 的相機位置：差太多的影格不拿來建模
-    Ccam, fwd, Rcam = cam_centers_dirs(extrinsic)
-    s1, R1, t1 = umeyama(Ccam, C_ar)
-    res = np.linalg.norm((s1 * Ccam @ R1.T + t1) - C_ar, axis=1)
-    keep_fit = res <= np.percentile(res, 80)
-    s1, R1, t1 = umeyama(Ccam[keep_fit], C_ar[keep_fit])
-    res = np.linalg.norm((s1 * Ccam @ R1.T + t1) - C_ar, axis=1)
-    rms_cm = float(np.sqrt(np.mean(res[keep_fit] ** 2)) * 100)
-    pose_thr = max(0.02, 3.0 * np.median(res))
-    frame_ok = res <= pose_thr
-    bad_pose = [int(i) for i in np.nonzero(~frame_ok)[0]]
-    log(f"ARKit 對齊：殘差 {rms_cm:.2f} cm；相機位置不一致而略過的影格 {bad_pose}")
-    if rms_cm > 3:
-        WARN.append(f"相機軌跡對齊誤差偏大（{rms_cm:.1f} cm），尺寸可能不準")
-    if len(bad_pose) > 0.3 * len(frame_ok):
-        WARN.append(f"有 {len(bad_pose)} 張影格的相機位置不可靠，建議放慢速度、保持距離重拍")
-    prompts = find_prompts(extrinsic, intrinsic, depth, W0, H0, padL, padT, sx, sy)
-    target_method = "3D 自動定位"
-    if not prompts:
-        target_method = "畫面中央（3D 定位失敗）"
-        WARN.append("無法用 3D 定位物體，改用畫面中央")
-        prompts = {int(i): (W0 / 2, H0 / 2) for i in sorted(set(np.linspace(0, len(frame_paths) - 1, 4).astype(int)))}
-    log(f"物體定位（{target_method}）：提示影格 {sorted(prompts)}")
-    MASKS = run_sam(SEL, len(frame_paths), W0, H0, prompts)
+    crop_src = frame_paths
+    if TT:
+        # ---- 2T. 轉盤模式：先用 SAM 2 分出「物體」和「比例尺」，把背景遮掉後再交給 VGGT ----
+        sel_of = {frames[i]["file"]: k for k, i in enumerate(pick)}
+        if objp and objp["frame"] in sel_of:
+            obj_prompts = {sel_of[objp["frame"]]: [tuple(objp["p"])]}
+            target_method = "使用者標記"
+        else:
+            obj_prompts = {int(i): [(W0 / 2, H0 / 2)] for i in sorted(set(np.linspace(0, len(frame_paths) - 1, 4).astype(int)))}
+            target_method = "畫面中央"
+        ruler_prompts, marks_sel = {}, []
+        for m in marks:
+            if m["frame"] in sel_of:
+                k = sel_of[m["frame"]]
+                p1, p2 = np.array(m["p1"], float), np.array(m["p2"], float)
+                ruler_prompts[k] = [tuple(p1 * 0.95 + p2 * 0.05), tuple(p1 * 0.05 + p2 * 0.95)]   # 只用兩端附近（中段可能被物體擋住）
+                marks_sel.append((k, p1, p2))
+        prompts = {k: v[0] for k, v in obj_prompts.items()}
+        mk = run_sam_objects(SEL, len(frame_paths), W0, H0, {1: obj_prompts, 2: ruler_prompts})
+        MASKS, RMASK = mk[1], mk[2]
+        MSEL = f"{TMP}/msel"
+        shutil.rmtree(MSEL, ignore_errors=True); os.makedirs(MSEL)
+        k15 = np.ones((15, 15), np.uint8)
+        crop_src = []
+        for k, pth in enumerate(frame_paths):
+            im = np.asarray(Image.open(pth).convert("RGB")).copy()
+            keepm = cv2.dilate((MASKS[k] | RMASK[k]).astype(np.uint8), k15) > 0
+            im[~keepm] = 128                                  # 背景塗成灰色
+            q = f"{MSEL}/{k:03d}.jpg"
+            Image.fromarray(im).save(q, quality=95)
+            crop_src.append(q)
+        log(f"轉盤模式：物體與比例尺遮罩完成（物體提示：{target_method}）")
+        extrinsic, intrinsic, depth, conf, imgs, batch_of, NB = run_vggt_batches_anchor(crop_src, N_batch)
+        m_per_unit, ruler_pts, Ls = ruler_scale(marks_sel, extrinsic, intrinsic, depth, RMASK, sx, sy, padL, padT,
+                                                float(meta.get("scale_length_cm", 15.0)))
+        if len(Ls) > 1 and (max(Ls) - min(Ls)) / np.median(Ls) > 0.06:
+            WARN.append(f"各影格量到的比例尺長度差異 {(max(Ls)-min(Ls))/np.median(Ls):.0%}，尺寸可能不準")
+        extrinsic[:, :, 3] *= m_per_unit; depth *= m_per_unit     # 換成公尺
+        ruler_pts = ruler_pts * m_per_unit
+        up_tt, g_spread = gravity_up(T_ar[pick], extrinsic)
+        log(f"比例尺：{len(Ls)} 張影格；重力方向一致性 {g_spread:.1f}°")
+        if g_spread > 8:
+            WARN.append(f"重力方向估計的分散度 {g_spread:.0f}°，物體可能不是繞垂直軸旋轉")
+        Ccam, fwd, Rcam = cam_centers_dirs(extrinsic)
+        frame_ok = np.ones(len(frame_paths), bool); bad_pose = []; rms_cm = 0.0
+        log(f"物體定位（{target_method}）：提示影格 {sorted(prompts)}")
+    else:
+        # ---- 2. VGGT 第一次 + SAM 2 ----
+        extrinsic, intrinsic, depth, conf, imgs, batch_of, NB = run_vggt_batches(frame_paths, C_ar, N_batch)
+        log(f"VGGT 第一次完成（{NB} 批，共 {len(frame_paths)} 張）")
+        # 用 ARKit 軌跡檢查 VGGT 的相機位置：差太多的影格不拿來建模
+        Ccam, fwd, Rcam = cam_centers_dirs(extrinsic)
+        s1, R1, t1 = umeyama(Ccam, C_ar)
+        res = np.linalg.norm((s1 * Ccam @ R1.T + t1) - C_ar, axis=1)
+        keep_fit = res <= np.percentile(res, 80)
+        s1, R1, t1 = umeyama(Ccam[keep_fit], C_ar[keep_fit])
+        res = np.linalg.norm((s1 * Ccam @ R1.T + t1) - C_ar, axis=1)
+        rms_cm = float(np.sqrt(np.mean(res[keep_fit] ** 2)) * 100)
+        pose_thr = max(0.02, 3.0 * np.median(res))
+        frame_ok = res <= pose_thr
+        bad_pose = [int(i) for i in np.nonzero(~frame_ok)[0]]
+        log(f"ARKit 對齊：殘差 {rms_cm:.2f} cm；相機位置不一致而略過的影格 {bad_pose}")
+        if rms_cm > 3:
+            WARN.append(f"相機軌跡對齊誤差偏大（{rms_cm:.1f} cm），尺寸可能不準")
+        if len(bad_pose) > 0.3 * len(frame_ok):
+            WARN.append(f"有 {len(bad_pose)} 張影格的相機位置不可靠，建議放慢速度、保持距離重拍")
+        prompts = find_prompts(extrinsic, intrinsic, depth, W0, H0, padL, padT, sx, sy)
+        target_method = "3D 自動定位"
+        if not prompts:
+            target_method = "畫面中央（3D 定位失敗）"
+            WARN.append("無法用 3D 定位物體，改用畫面中央")
+            prompts = {int(i): (W0 / 2, H0 / 2) for i in sorted(set(np.linspace(0, len(frame_paths) - 1, 4).astype(int)))}
+        log(f"物體定位（{target_method}）：提示影格 {sorted(prompts)}")
+        MASKS = run_sam(SEL, len(frame_paths), W0, H0, prompts)
     area = MASKS.reshape(len(MASKS), -1).mean(1)
     med = float(np.median(area))
     bad = [int(i) for i in np.nonzero((area < 0.2 * med) | (area > 3.0 * med))[0]]
@@ -937,7 +1128,7 @@ def main():
             x0 = int(np.clip((xs.min() + xs.max()) / 2 - side / 2, 0, W0 - side))
             y0 = int(np.clip((ys.min() + ys.max()) / 2 - side / 2, 0, H0 - side))
             p = f"{HR}/{fi:03d}.png"
-            Image.open(frame_paths[fi]).convert("RGB").crop((x0, y0, x0 + side, y0 + side)).resize((518, 518), Image.BICUBIC).save(p)
+            Image.open(crop_src[fi]).convert("RGB").crop((x0, y0, x0 + side, y0 + side)).resize((518, 518), Image.BICUBIC).save(p)
             crop_info[fi] = (x0, y0, side); hr_paths.append(p); hr_fids.append(fi)
         v2 = {"depth": [], "conf": [], "imgs": []}
         hr_order = []
@@ -976,7 +1167,10 @@ def main():
     valid[:, padT + 2:padT + nh - 2, padL + 2:padL + nw - 2] = True
     valid &= depth > 1e-6
     bg_px = valid & ~BDIL & frame_ok[:, None, None]
-    bg_px &= conf >= np.percentile(conf[bg_px], CONF_DROP_PERCENT)
+    if TT:
+        bg_px[:] = False                                  # 轉盤模式背景已遮掉，沒有桌面點
+    elif bg_px.any():
+        bg_px &= conf >= np.percentile(conf[bg_px], CONF_DROP_PERCENT)
     P_bg0 = world[bg_px].astype(np.float64)
     COL_bg = np.clip(imgs[bg_px].astype(np.float64), 0, 1)
     obj_px = valid & BMASK
@@ -1056,28 +1250,43 @@ def main():
     del tsdf_in
     log(f"物體點 {len(P_obj0):,}，背景點 {len(P_bg0):,}")
 
-    # ---- 5. 用 ARKit 相機位置換算真實尺寸（公尺）與重力方向（相似轉換已在前面算好）----
-    M = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], float)     # ARKit y-up → z-up
-    to_cm1 = lambda P: 100.0 * ((s1 * P @ R1.T + t1) @ M.T)
-    Pb1, Pg1, C1 = to_cm1(P_obj0), to_cm1(P_bg0), to_cm1(Ccam)
+    if TT:
+        # ---- 5T. 轉盤模式：世界座標已是公尺；上方＝重力反方向；桌面高度＝比例尺所在高度 ----
+        center = np.median(P_obj0, 0)
+        h_ruler = float(np.median(ruler_pts @ up_tt))         # 比例尺上表面（筆之類較厚時會偏高）
+        h_obj = float(np.percentile(P_obj0 @ up_tt, 0.5))     # 物體最低處
+        h0 = min(h_ruler, h_obj)
+        Ra2, o2 = align_transform(up_tt, -h0, center, Ccam[0])
+        A = Ra2
+        to_al = lambda P: 100.0 * (P - o2) @ Ra2.T
+        Pb_tmp = to_al(P_obj0)
+        size0 = np.percentile(Pb_tmp, 98, 0) - np.percentile(Pb_tmp, 2, 0)
+        U = float(np.clip(size0.max() / 12.0, 0.5, 6.0))
+        has_table = True
+        del Pb_tmp
+    else:
+        # ---- 5. 用 ARKit 相機位置換算真實尺寸（公尺）與重力方向（相似轉換已在前面算好）----
+        M = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], float)     # ARKit y-up → z-up
+        to_cm1 = lambda P: 100.0 * ((s1 * P @ R1.T + t1) @ M.T)
+        Pb1, Pg1, C1 = to_cm1(P_obj0), to_cm1(P_bg0), to_cm1(Ccam)
 
-    center = np.median(Pb1, 0)
-    size0 = np.percentile(Pb1, 98, 0) - np.percentile(Pb1, 2, 0)
-    U = float(np.clip(size0.max() / 12.0, 0.5, 6.0))           # 長度單位：小熊（12 cm）= 1
-    Dcam = np.median(np.linalg.norm(C1 - center, axis=1))
-    has_table = True
-    try:
-        n_pl, d_pl, frac = fit_table_plane(Pg1, center, C1, radius=0.6 * Dcam,
-                                           dist_thr=max(0.3, 0.006 * Dcam), up_prior=np.array([0, 0, 1.0]))
-    except RuntimeError:
-        has_table = False
-        WARN.append("找不到桌面，以物體最低點為底")
-        n_pl = np.array([0, 0, 1.0]); d_pl = -np.percentile(Pb1[:, 2], 1)
-    Ra2, o2 = align_transform(n_pl, d_pl, center, C1[0])
-    k_al = 100.0 * s1
-    A = Ra2 @ M @ R1
-    b_al = Ra2 @ (100.0 * M @ t1 - o2)
-    to_al = lambda P: k_al * P @ A.T + b_al
+        center = np.median(Pb1, 0)
+        size0 = np.percentile(Pb1, 98, 0) - np.percentile(Pb1, 2, 0)
+        U = float(np.clip(size0.max() / 12.0, 0.5, 6.0))           # 長度單位：小熊（12 cm）= 1
+        Dcam = np.median(np.linalg.norm(C1 - center, axis=1))
+        has_table = True
+        try:
+            n_pl, d_pl, frac = fit_table_plane(Pg1, center, C1, radius=0.6 * Dcam,
+                                               dist_thr=max(0.3, 0.006 * Dcam), up_prior=np.array([0, 0, 1.0]))
+        except RuntimeError:
+            has_table = False
+            WARN.append("找不到桌面，以物體最低點為底")
+            n_pl = np.array([0, 0, 1.0]); d_pl = -np.percentile(Pb1[:, 2], 1)
+        Ra2, o2 = align_transform(n_pl, d_pl, center, C1[0])
+        k_al = 100.0 * s1
+        A = Ra2 @ M @ R1
+        b_al = Ra2 @ (100.0 * M @ t1 - o2)
+        to_al = lambda P: k_al * P @ A.T + b_al
     Pc_b, Pc_g, Cc = to_al(P_obj0), to_al(P_bg0), to_al(Ccam)
     Pc_src = to_al(src_P)
     del P_obj0, P_bg0
@@ -1136,6 +1345,7 @@ def main():
                 params_used=PARAMS_USED,
                 params_summary=("、".join(f"{k}={v}" for k, v in PARAMS_USED.items()) or "全部預設"))
     ext = bp.max(0) - bp.min(0)
+    info.update(mode="turntable" if TT else "orbit")
     info.update(target_method=target_method, prompt_frames=len(prompts), bad_pose_frames=len(bad_pose),
                 batches=int(NB), smooth_level=SMOOTH_LEVEL,
                 consistency_keep=round(float(keepc.mean()), 3),
@@ -1187,7 +1397,7 @@ def build_mesh(Pc_b, COL_b, FID_b, Pc_g, COL_g, Cc, U, has_table, src_P=None, sr
     cxy = (bpx.min(0) + bpx.max(0)) / 2
     R_base = np.linalg.norm(bpx - cxy, axis=1).max() + (DEV_BASE_MARGIN if DEV_BASE_MARGIN > 0 else max(1.0, 0.15 * np.ptp(bpx, axis=0).max()))
     tm = (np.abs(Pc_g[:, 2]) < 0.3 * U) & (np.linalg.norm(Pc_g[:, :2] - cxy, axis=1) < R_base + 2 * U)
-    use_base = has_table and tm.sum() > 200 and USE_BASE
+    use_base = has_table and USE_BASE and (tm.sum() > 200 or len(Pc_g) == 0)
     margin = 0.3 * U
     solid_target = DEV_SOLID_MM / 10.0 if DEV_SOLID_MM > 0 else SOLID_VOXEL * U
     mesh, vox = voxel_solid(pm, solid_target, base=(cxy, R_base, T_BASE) if use_base else None, sink=SINK,
@@ -1203,9 +1413,13 @@ def build_mesh(Pc_b, COL_b, FID_b, Pc_g, COL_g, Cc, U, has_table, src_P=None, sr
     is_obj = V3[:, 2] > 1.5 * vox
     if use_base:
         top = ~is_obj & (V3[:, 2] > -0.75 * vox)
-        _, ti = cKDTree(Pc_g[tm][:, :2]).query(V3[top][:, :2], k=8)
-        cols[top] = COL_g[tm][ti].mean(1)
-        cols[~is_obj & ~top] = np.median(COL_g[tm], 0) * 0.85
+        if tm.sum() > 0:
+            _, ti = cKDTree(Pc_g[tm][:, :2]).query(V3[top][:, :2], k=8)
+            cols[top] = COL_g[tm][ti].mean(1)
+            cols[~is_obj & ~top] = np.median(COL_g[tm], 0) * 0.85
+        else:                                             # 沒有桌面點（轉盤模式）：底座用淺灰色
+            cols[top] = 0.78
+            cols[~is_obj & ~top] = 0.66
     else:
         cols[~is_obj] = 0.7
     _, fb = cKDTree(bp).query(V3[is_obj], k=4)

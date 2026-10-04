@@ -67,6 +67,25 @@ final class JobManager: ObservableObject {
     @Published var jobId: String?
     @Published var result: JobResult?
     @Published var canResume = false
+    @Published var showMarkScale = false
+
+    /// 目前錄影的設定（拍攝方式、是否已標記比例尺）
+    func currentMeta() -> CaptureMeta? {
+        guard let dir = captureURL,
+              let data = try? Data(contentsOf: dir.appendingPathComponent("meta.json")) else { return nil }
+        return try? JSONDecoder().decode(CaptureMeta.self, from: data)
+    }
+    var captureIsTurntable: Bool { currentMeta()?.mode == "turntable" }
+    var captureHasMarks: Bool { !(currentMeta()?.scale_marks ?? []).isEmpty }
+
+    func marksSaved() {
+        objectWillChange.send()
+        if captureIsTurntable && captureHasMarks {
+            phase = .captured
+            status = "比例尺已標記"
+            detail = "可以按「生成 3D 模型」"
+        }
+    }
 
     private var task: Task<Void, Never>?
     let datasetSlug = "obj3d-capture-data"
@@ -120,6 +139,11 @@ final class JobManager: ObservableObject {
         phase = .captured
         status = "已錄好 \(frames) 張影格"
         detail = "按「生成 3D 模型」上傳到 Kaggle 運算"
+        if captureIsTurntable && !captureHasMarks {
+            status = "已錄好 \(frames) 張影格（物體旋轉模式）"
+            detail = "請先標記比例尺兩端"
+            showMarkScale = true
+        }
     }
 
     func generate() {
@@ -172,6 +196,11 @@ final class JobManager: ObservableObject {
         phase = .working
         setBusy(true)
         defer { setBusy(false) }
+        if captureIsTurntable && !captureHasMarks {
+            fail("物體旋轉模式需要先標記比例尺兩端")
+            showMarkScale = true
+            return
+        }
         do {
             let jobId = try CaptureStore.assignNewJobId(dir)     // 同一段錄影可以重複生成
             self.jobId = jobId

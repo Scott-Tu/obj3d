@@ -6,6 +6,7 @@ struct CaptureInfo: Identifiable {
     let url: URL
     let frames: Int
     let date: Date
+    let mode: String
     var id: String { url.path }
 }
 
@@ -25,7 +26,7 @@ enum CaptureStore {
                   let meta = try? JSONDecoder().decode(CaptureMeta.self, from: data),
                   !meta.frames.isEmpty else { continue }
             let date = (try? d.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date.distantPast
-            out.append(CaptureInfo(url: d, frames: meta.frames.count, date: date))
+            out.append(CaptureInfo(url: d, frames: meta.frames.count, date: date, mode: meta.mode ?? "orbit"))
         }
         return out.sorted { $0.date > $1.date }
     }

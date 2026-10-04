@@ -5,6 +5,7 @@ struct ContentView: View {
     @State private var showCapture = false
     @State private var showLibrary = false
     @State private var showRuler = true
+    @AppStorage("captureMode") private var captureMode = "orbit"
 
     var body: some View {
         NavigationStack {
@@ -26,11 +27,16 @@ struct ContentView: View {
                     }
                 }
             }
+            .sheet(isPresented: $job.showMarkScale) {
+                if let dir = job.captureURL {
+                    MarkScaleView(captureURL: dir) { job.marksSaved() }
+                }
+            }
             .sheet(isPresented: $showLibrary) {
                 CaptureLibraryView().environmentObject(job)
             }
             .fullScreenCover(isPresented: $showCapture) {
-                CaptureView { url, jobId, count in
+                CaptureView(mode: captureMode) { url, jobId, count in
                     job.setCapture(url: url, jobId: jobId, frames: count)
                 }
             }
@@ -118,6 +124,18 @@ struct ContentView: View {
 
     private var buttonStack: some View {
         VStack(spacing: 12) {
+            Picker("拍攝方式", selection: $captureMode) {
+                Text("手機繞物體").tag("orbit")
+                Text("物體旋轉").tag("turntable")
+            }
+            .pickerStyle(.segmented)
+            .disabled(job.busy)
+            Text(captureMode == "orbit"
+                 ? "物體不動，拿著手機繞物體一圈；尺寸由手機的動作追蹤換算。"
+                 : "手機大致不動，旋轉物體（例如放在轉盤上）；需要在轉盤上放一支已知長度的比例尺。")
+                .font(.footnote).foregroundColor(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
             Button {
                 showCapture = true
             } label: {
@@ -136,6 +154,18 @@ struct ContentView: View {
             .tint(.orange)
             .controlSize(.large)
             .disabled(job.busy || job.captureURL == nil)
+
+            if job.captureURL != nil && job.captureIsTurntable {
+                Button {
+                    job.showMarkScale = true
+                } label: {
+                    Label(job.captureHasMarks ? "重新標記比例尺" : "標記比例尺（必要）", systemImage: "ruler")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+                .disabled(job.busy)
+            }
 
             Button {
                 showLibrary = true
