@@ -5,7 +5,7 @@
 #        preview.bin（App 預覽用）、result_meta.json
 # =====================================================================
 JOB_ID = "__JOB_ID__"
-RUNNER_VERSION = "2026.10.05-devparams"   # 每次修改運算程式時更新
+RUNNER_VERSION = "2026.10.05-params2"   # 每次修改運算程式時更新
 SMOOTH_LEVEL = "__SMOOTH__"      # low / medium / high（由 App 設定）
 
 import os, sys, json, time, glob, shutil, subprocess, zipfile, traceback
@@ -24,23 +24,58 @@ USE_TSDF = True                  # 深度圖用 TSDF 融合（平均掉雜訊，
 TEXTURE_SIZE = 2048              # 貼圖解析度
 TSDF_MAX_RES = 384               # TSDF 格子數上限（每邊）
 
-# ---- App「開發者參數」：由 App 填入 JSON；0 或缺少 = 自動 ----
+CONF_DROP_PERCENT = 40
+HR_TOL = 0.04
+MASK_ERODE_PX = 4
+MAX_FRAMES = 0          # 0 = 依 GPU 記憶體自動決定
+
+# ---- App「開發者參數」：由 App 填入 JSON；0 或缺少 = 用程式預設值 ----
 PARAMS_JSON = r"""__PARAMS__"""
 try:
     PARAMS = json.loads(PARAMS_JSON) if not PARAMS_JSON.startswith("__") else {}
 except Exception:
     PARAMS = {}
-DEV_SOLID_MM = float(PARAMS.get("solid_voxel_mm") or 0)      # 封閉實體的體素大小（mm）
-DEV_TRUNC_MM = float(PARAMS.get("tsdf_trunc_mm") or 0)       # TSDF 截斷距離（mm）
-if int(PARAMS.get("batches") or 0) > 0:
-    MAX_BATCHES = int(PARAMS["batches"])
-if "use_tsdf" in PARAMS:
-    USE_TSDF = bool(PARAMS["use_tsdf"])
-USE_TEXTURE = bool(PARAMS.get("use_texture", True))
-CONF_DROP_PERCENT = 40
-HR_TOL = 0.04
-MASK_ERODE_PX = 4
-MAX_FRAMES = 0          # 0 = 依 GPU 記憶體自動決定
+
+
+def _p(name, default):
+    try:
+        v = float(PARAMS.get(name))
+    except (TypeError, ValueError):
+        return default
+    return v if v > 0 else default
+
+
+def _flag(name, default=True):
+    v = PARAMS.get(name)
+    if v is None:
+        return default
+    try:
+        return bool(float(v))
+    except (TypeError, ValueError):
+        return bool(v)
+
+
+CONF_DROP_PERCENT = _p("conf_drop_percent", CONF_DROP_PERCENT)
+MASK_ERODE_PX = int(_p("mask_erode_px", MASK_ERODE_PX))
+HR_TOL = _p("hr_tol_pct", HR_TOL * 100) / 100
+CONS_TOL = _p("consistency_tol_pct", 2.5) / 100
+POISSON_DEPTH = int(_p("poisson_depth", POISSON_DEPTH))
+TSDF_MAX_RES = int(_p("tsdf_max_res", TSDF_MAX_RES))
+TEXTURE_SIZE = int(_p("texture_size", TEXTURE_SIZE))
+MAX_BATCHES = int(_p("batches", MAX_BATCHES))
+DEV_FRAMES_PER_BATCH = int(_p("max_frames_per_batch", 0))
+DEV_SOLID_MM = _p("solid_voxel_mm", 0)
+DEV_TRUNC_MM = _p("tsdf_trunc_mm", 0)
+DEV_BASE_MARGIN = _p("base_margin_cm", 0)
+SMOOTH_ITERS = int(_p("extra_smooth_iters", SMOOTH_ITERS))      # 0.5 代表「0 次」
+USE_TSDF = _flag("use_tsdf", USE_TSDF)
+USE_TEXTURE = _flag("use_texture", True)
+USE_HIRES = _flag("use_hires", True)
+DEPTH_REFINE = _flag("depth_refine", True)
+USE_BASE = _flag("use_base", True)
+PARAMS_USED = {k: v for k, v in PARAMS.items()
+               if k != "capture_fps" and ((isinstance(v, bool) and not v) or (not isinstance(v, bool) and v not in (0, 0.0, None)))}
+
 SOLID_VOXEL = 0.06      # 封閉實體的體素大小（cm，以 12 cm 物體為基準，會依物體大小縮放）
 
 
@@ -369,17 +404,12 @@ def bake_texture(mesh, color_fn, tex_size=2048, max_faces=200_000):
     cols = color_fn(P, Nn)
     tex = np.zeros((R, R, 3), np.float32)
     tex[ys, xs] = cols
-    filled = (tri_id >= 0).astype(np.uint8)
-    k3 = np.ones((3, 3), np.uint8)
-    for _ in range(8):                                     # 往外擴幾圈，避免貼圖接縫露出黑邊
-        grown = cv2.dilate(filled, k3)
-        ring = (grown > 0) & (filled == 0)
-        if not ring.any():
-            break
-        blur = cv2.blur(tex * filled[..., None], (3, 3))
-        cnt = cv2.blur(filled.astype(np.float32), (3, 3))
-        tex[ring] = blur[ring] / np.maximum(cnt[ring, None], 1e-6)
-        filled = grown
+    # 把整張貼圖的空白處都填上「最近的已上色像素」：縮圖（mipmap）時就不會混進黑色，避免黑點與黑邊
+    from scipy import ndimage
+    empty = tri_id < 0
+    if empty.any():
+        idx = ndimage.distance_transform_edt(empty, return_distances=False, return_indices=True)
+        tex = tex[idx[0], idx[1]]
     tex8 = (np.clip(tex, 0, 1) * 255).astype(np.uint8)
     return V2, Fi.astype(np.int32), UV.astype(np.float32), tex8, m
 
@@ -738,7 +768,50 @@ def tsdf_fuse(frames, extrinsic, P_ref):
         E = np.eye(4); E[:3, :4] = extrinsic[fi]
         vol.integrate(rgbd, o3d.camera.PinholeCameraIntrinsic(W, H, float(fx), float(fy), float(cx), float(cy)), E)
     pc = vol.extract_point_cloud()
-    return np.asarray(pc.points), np.asarray(pc.colors), vox
+    return np.asarray(pc.points), np.asarray(pc.colors), vox, vol.extract_triangle_mesh()
+
+
+def refine_depth_frames(frames, extrinsic, ref_mesh):
+    """逐張深度校正：把每張深度圖對齊到初步融合出的共同表面，
+    擬合 d_ref ≈ a·d + b + c·u + e·v（倍數、偏移、左右／上下傾斜），用穩健迴歸排除離群值。"""
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(ref_mesh))
+    out, before, after = [], [], []
+    for fi, d, (fx, fy, cx, cy), col in frames:
+        H, W = d.shape
+        vv, uu = np.nonzero(d > 0)
+        if len(uu) < 500:
+            out.append((fi, d, (fx, fy, cx, cy), col)); continue
+        R = extrinsic[fi][:, :3].astype(np.float64); t = extrinsic[fi][:, 3].astype(np.float64)
+        C = -R.T @ t
+        dc = np.stack([(uu - cx) / fx, (vv - cy) / fy, np.ones(len(uu))], 1)
+        dw = dc @ R                                       # z_cam = 1 → 命中距離 t 就是深度
+        rays = np.hstack([np.broadcast_to(C, dw.shape), dw]).astype(np.float32)
+        tr = scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy().astype(np.float64)
+        z = d[vv, uu].astype(np.float64)
+        good = np.isfinite(tr) & (np.abs(tr - z) < 0.15 * z)
+        if good.sum() < 300:
+            out.append((fi, d, (fx, fy, cx, cy), col)); continue
+        un, vn = (uu - W / 2) / W, (vv - H / 2) / H
+        X = np.stack([z, np.ones_like(z), un, vn], 1)[good]; y = tr[good]
+        w = np.ones(len(y))
+        for _ in range(4):                                # Huber 加權最小平方
+            sw = np.sqrt(w)
+            coef = np.linalg.lstsq(X * sw[:, None], y * sw, rcond=None)[0]
+            res = y - X @ coef
+            s = 1.4826 * np.median(np.abs(res)) + 1e-9
+            w = np.minimum(1.0, 1.5 * s / np.maximum(np.abs(res), 1e-12))
+        a_, b_, c_, e_ = coef
+        if not (0.85 < a_ < 1.15) or abs(b_) > 0.03:
+            out.append((fi, d, (fx, fy, cx, cy), col)); continue
+        before.append(np.median(np.abs(y - X[:, 0])))
+        after.append(np.median(np.abs(res)))
+        dn = np.zeros_like(d)
+        dn[vv, uu] = (a_ * z + b_ + c_ * un + e_ * vn).astype(np.float32)
+        out.append((fi, dn, (fx, fy, cx, cy), col))
+    if before:
+        log(f"逐張深度校正：與共同表面的差距中位數 {np.median(before)*1000:.2f} mm → {np.median(after)*1000:.2f} mm")
+    return out
 
 
 def consistency_filter(P, F, extrinsic, intrinsic, depth, frame_ok, box, tol=0.025, min_support=2):
@@ -790,6 +863,8 @@ def main():
     # ---- 1. 挑影格 ----
     gb = gpu_memory_gb()
     N_batch = int(np.clip((gb - 3.5) / 0.23, 16, 150))
+    if DEV_FRAMES_PER_BATCH > 0:
+        N_batch = DEV_FRAMES_PER_BATCH
     N = MAX_FRAMES or N_batch * MAX_BATCHES
     N = min(N, len(paths))
     sc = np.array([sharpness(p) for p in paths])
@@ -848,34 +923,38 @@ def main():
     if len(bad) > 0.3 * len(MASKS):
         WARN.append(f"有 {len(bad)} 張影格的遮罩異常，請看診斷圖")
 
-    # ---- 3. 高解析第二次推論（只裁物體附近）----
-    HR = f"{TMP}/crops"
-    shutil.rmtree(HR, ignore_errors=True); os.makedirs(HR)
     crop_info, hr_paths, hr_fids = {}, [], []
-    for fi, m in enumerate(MASKS):
-        ys, xs = np.nonzero(m)
-        if len(xs) < 500:
-            continue
-        side = int(min(max(np.ptp(xs), np.ptp(ys)) * 1.3 + 20, W0, H0))
-        x0 = int(np.clip((xs.min() + xs.max()) / 2 - side / 2, 0, W0 - side))
-        y0 = int(np.clip((ys.min() + ys.max()) / 2 - side / 2, 0, H0 - side))
-        p = f"{HR}/{fi:03d}.png"
-        Image.open(frame_paths[fi]).convert("RGB").crop((x0, y0, x0 + side, y0 + side)).resize((518, 518), Image.BICUBIC).save(p)
-        crop_info[fi] = (x0, y0, side); hr_paths.append(p); hr_fids.append(fi)
-    v2 = {"depth": [], "conf": [], "imgs": []}
-    hr_order = []
-    for b in range(NB):
-        sel = [j for j, fi in enumerate(hr_fids) if batch_of[fi] == b]
-        if not sel:
-            continue
-        vb = run_vggt([hr_paths[j] for j in sel], "crop", False)
-        for k, j in enumerate(sel):
-            v2["depth"].append(vb["depth"][k]); v2["conf"].append(vb["conf"][k]); v2["imgs"].append(vb["imgs"][k])
-            hr_order.append(j)
-        del vb
-    order = np.argsort(hr_order)
-    v2 = {k: np.stack([v2[k][o] for o in order]) for k in v2}
-    log("VGGT 第二次完成")
+    v2 = None
+    if USE_HIRES:
+        # ---- 3. 高解析第二次推論（只裁物體附近）----
+        HR = f"{TMP}/crops"
+        shutil.rmtree(HR, ignore_errors=True); os.makedirs(HR)
+        for fi, m in enumerate(MASKS):
+            ys, xs = np.nonzero(m)
+            if len(xs) < 500:
+                continue
+            side = int(min(max(np.ptp(xs), np.ptp(ys)) * 1.3 + 20, W0, H0))
+            x0 = int(np.clip((xs.min() + xs.max()) / 2 - side / 2, 0, W0 - side))
+            y0 = int(np.clip((ys.min() + ys.max()) / 2 - side / 2, 0, H0 - side))
+            p = f"{HR}/{fi:03d}.png"
+            Image.open(frame_paths[fi]).convert("RGB").crop((x0, y0, x0 + side, y0 + side)).resize((518, 518), Image.BICUBIC).save(p)
+            crop_info[fi] = (x0, y0, side); hr_paths.append(p); hr_fids.append(fi)
+        v2 = {"depth": [], "conf": [], "imgs": []}
+        hr_order = []
+        for b in range(NB):
+            sel = [j for j, fi in enumerate(hr_fids) if batch_of[fi] == b]
+            if not sel:
+                continue
+            vb = run_vggt([hr_paths[j] for j in sel], "crop", False)
+            for k, j in enumerate(sel):
+                v2["depth"].append(vb["depth"][k]); v2["conf"].append(vb["conf"][k]); v2["imgs"].append(vb["imgs"][k])
+                hr_order.append(j)
+            del vb
+        order = np.argsort(hr_order)
+        v2 = {k: np.stack([v2[k][o] for o in order]) for k in v2}
+        log("VGGT 第二次完成")
+    else:
+        log("已在開發者參數中關閉高解析第二次推論")
 
     # ---- 4. 點雲（VGGT 座標）----
     S_, H, W = depth.shape
@@ -940,10 +1019,14 @@ def main():
         COL_obj = np.concatenate(hc).astype(np.float64)
         FID_obj = np.concatenate(hf)
     else:
-        WARN.append("高解析推論沒有可用的點，改用第一次推論")
+        if USE_HIRES:
+            WARN.append("高解析推論沒有可用的點，改用第一次推論")
         P_obj0, COL_obj, FID_obj = P_obj1, np.clip(imgs[obj_px], 0, 1).astype(np.float64), np.nonzero(obj_px)[0]
+        tsdf_in = [(i, np.where(obj_px[i], depth[i], 0).astype(np.float32),
+                    (intrinsic[i][0, 0], intrinsic[i][1, 1], intrinsic[i][0, 2], intrinsic[i][1, 2]),
+                    (np.clip(imgs[i], 0, 1) * 255).astype(np.uint8)) for i in range(len(depth)) if obj_px[i].any()]
     ok_mask = frame_ok & np.array([not np.all(~m) for m in MASKS])
-    keepc = consistency_filter(P_obj0, FID_obj, extrinsic, intrinsic, depth, ok_mask, (padL, padT, nw, nh))
+    keepc = consistency_filter(P_obj0, FID_obj, extrinsic, intrinsic, depth, ok_mask, (padL, padT, nw, nh), tol=CONS_TOL)
     log(f"多視角一致性：保留 {keepc.mean():.0%} 的物體點")
     if keepc.mean() < 0.15:
         WARN.append("多視角一致性過低，可能是拍攝太快或光線太暗")
@@ -953,7 +1036,11 @@ def main():
     tsdf_used = False
     if USE_TSDF and len(tsdf_in) >= 8:
         try:
-            Pt, Ct, tvox = tsdf_fuse(tsdf_in, extrinsic, P_obj0)
+            Pt, Ct, tvox, tmesh = tsdf_fuse(tsdf_in, extrinsic, P_obj0)
+            if DEPTH_REFINE and len(tmesh.triangles) > 1000:
+                tsdf_in = refine_depth_frames(tsdf_in, extrinsic, tmesh)
+                Pt, Ct, tvox, tmesh = tsdf_fuse(tsdf_in, extrinsic, P_obj0)
+            del tmesh
             if len(Pt) > 5000:
                 sub = np.random.default_rng(1).choice(len(src_P), min(len(src_P), 2_000_000), replace=False)
                 src_P, src_F = src_P[sub], src_F[sub]
@@ -1034,10 +1121,11 @@ def main():
             out[~ob & ~top] = base_side
             return out
 
-        if not USE_TEXTURE:
-            raise RuntimeError("已在開發者參數中關閉貼圖")
-        tex_pack = bake_texture(mesh, color_fn, tex_size=TEXTURE_SIZE)
-        log(f"貼圖完成（{TEXTURE_SIZE}×{TEXTURE_SIZE}，{len(tex_pack[1]):,} 面）")
+        if USE_TEXTURE:
+            tex_pack = bake_texture(mesh, color_fn, tex_size=TEXTURE_SIZE)
+            log(f"貼圖完成（{TEXTURE_SIZE}×{TEXTURE_SIZE}，{len(tex_pack[1]):,} 面）")
+        else:
+            log("已在開發者參數中關閉貼圖，改用頂點顏色")
     except Exception as e:
         traceback.print_exc()
         WARN.append(f"貼圖失敗，改用頂點顏色（{str(e)[:80]}）")
@@ -1045,8 +1133,8 @@ def main():
     # ---- 8. 匯出 ----
     export_all(mesh, tex_pack)
     info.update(tsdf=tsdf_used, textured=tex_pack is not None,
-                params_summary=f"實體 {DEV_SOLID_MM or '自動'} mm、截斷 {DEV_TRUNC_MM or '自動'} mm、"
-                               f"批次 {MAX_BATCHES}、TSDF {'開' if USE_TSDF else '關'}、貼圖 {'開' if USE_TEXTURE else '關'}")
+                params_used=PARAMS_USED,
+                params_summary=("、".join(f"{k}={v}" for k, v in PARAMS_USED.items()) or "全部預設"))
     ext = bp.max(0) - bp.min(0)
     info.update(target_method=target_method, prompt_frames=len(prompts), bad_pose_frames=len(bad_pose),
                 batches=int(NB), smooth_level=SMOOTH_LEVEL,
@@ -1097,9 +1185,9 @@ def build_mesh(Pc_b, COL_b, FID_b, Pc_g, COL_g, Cc, U, has_table, src_P=None, sr
 
     bpx = bp[:, :2]
     cxy = (bpx.min(0) + bpx.max(0)) / 2
-    R_base = np.linalg.norm(bpx - cxy, axis=1).max() + max(1.0, 0.15 * np.ptp(bpx, axis=0).max())
+    R_base = np.linalg.norm(bpx - cxy, axis=1).max() + (DEV_BASE_MARGIN if DEV_BASE_MARGIN > 0 else max(1.0, 0.15 * np.ptp(bpx, axis=0).max()))
     tm = (np.abs(Pc_g[:, 2]) < 0.3 * U) & (np.linalg.norm(Pc_g[:, :2] - cxy, axis=1) < R_base + 2 * U)
-    use_base = has_table and tm.sum() > 200
+    use_base = has_table and tm.sum() > 200 and USE_BASE
     margin = 0.3 * U
     solid_target = DEV_SOLID_MM / 10.0 if DEV_SOLID_MM > 0 else SOLID_VOXEL * U
     mesh, vox = voxel_solid(pm, solid_target, base=(cxy, R_base, T_BASE) if use_base else None, sink=SINK,

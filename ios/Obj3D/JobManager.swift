@@ -230,15 +230,7 @@ final class JobManager: ObservableObject {
         }
         let d = UserDefaults.standard
         let smooth = d.string(forKey: "smoothLevel") ?? "medium"
-        let params: [String: Any] = [
-            "solid_voxel_mm": d.double(forKey: "devSolidMM"),
-            "tsdf_trunc_mm": d.double(forKey: "devTruncMM"),
-            "batches": d.integer(forKey: "devBatches"),
-            "use_tsdf": d.object(forKey: "devUseTSDF") as? Bool ?? true,
-            "use_texture": d.object(forKey: "devUseTexture") as? Bool ?? true,
-        ]
-        let paramsJSON = (try? JSONSerialization.data(withJSONObject: params))
-            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        let paramsJSON = DevParams.json()
         let script = template.replacingOccurrences(of: "__JOB_ID__", with: jobId)
             .replacingOccurrences(of: "__SMOOTH__", with: smooth)
             .replacingOccurrences(of: "__PARAMS__", with: paramsJSON)

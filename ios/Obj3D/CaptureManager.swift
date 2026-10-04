@@ -36,7 +36,10 @@ final class CaptureManager: NSObject, ObservableObject, ARSessionDelegate {
 
     private let saveQueue = DispatchQueue(label: "obj3d.capture.save")
     private let ciContext = CIContext(options: nil)
-    private let interval: TimeInterval = 0.35
+    private var interval: TimeInterval {
+        let fps = DevParams.value(forKey: "capture_fps")
+        return 1.0 / (fps > 0 ? fps : 3.0)
+    }
     private let scale: CGFloat = 2.0 / 3.0           // 1440x1920 → 960x1280
     private var lastSavedTime: TimeInterval = 0      // 主執行緒
     private var inFlight = 0                         // 主執行緒

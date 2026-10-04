@@ -5,11 +5,6 @@ struct SettingsView: View {
     @AppStorage("machineShape") private var machineShape = "NvidiaTeslaT4"
     @AppStorage("smoothLevel") private var smoothLevel = "medium"
     @AppStorage("saveVideoToPhotos") private var saveVideoToPhotos = true
-    @AppStorage("devSolidMM") private var devSolidMM = 0.0
-    @AppStorage("devTruncMM") private var devTruncMM = 0.0
-    @AppStorage("devBatches") private var devBatches = 0
-    @AppStorage("devUseTSDF") private var devUseTSDF = true
-    @AppStorage("devUseTexture") private var devUseTexture = true
     @State private var apiKey = Keychain.get("kaggleKey") ?? ""
     @State private var testing = false
     @State private var testResult = ""
@@ -56,33 +51,16 @@ struct SettingsView: View {
                 }
             }
 
-            Section(header: Text("開發者參數（測試用）"),
-                    footer: Text("下次按「生成」時送到 Kaggle，不用重新編譯 App。可以用「從錄影存檔載入」對同一段錄影比較不同參數；結果卡片會顯示這次用的參數。")) {
-                Picker("實體解析度", selection: $devSolidMM) {
-                    Text("自動").tag(0.0)
-                    Text("0.75 mm").tag(0.75)
-                    Text("1.0 mm").tag(1.0)
-                    Text("1.5 mm").tag(1.5)
-                    Text("2.0 mm").tag(2.0)
-                }
-                Picker("TSDF 截斷距離", selection: $devTruncMM) {
-                    Text("自動").tag(0.0)
-                    Text("6 mm").tag(6.0)
-                    Text("8 mm").tag(8.0)
-                    Text("12 mm").tag(12.0)
-                    Text("16 mm").tag(16.0)
-                    Text("20 mm").tag(20.0)
-                }
-                Picker("VGGT 分批數", selection: $devBatches) {
-                    Text("自動（3）").tag(0)
-                    Text("1（約 50 張）").tag(1)
-                    Text("2（約 100 張）").tag(2)
-                    Text("3（約 150 張）").tag(3)
-                }
-                Toggle("TSDF 融合", isOn: $devUseTSDF)
-                Toggle("貼圖", isOn: $devUseTexture)
-                Button("恢復預設") {
-                    devSolidMM = 0; devTruncMM = 0; devBatches = 0; devUseTSDF = true; devUseTexture = true
+            Section(header: Text("開發者參數（測試用）")) {
+                NavigationLink {
+                    DevParamsView()
+                } label: {
+                    HStack {
+                        Text("調整運算參數")
+                        Spacer()
+                        Text(DevParams.changedCount == 0 ? "全部預設" : "已修改 \(DevParams.changedCount) 項")
+                            .foregroundColor(.secondary)
+                    }
                 }
             }
 
