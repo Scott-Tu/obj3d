@@ -3,6 +3,12 @@ import ARKit
 import CoreImage
 import ImageIO
 import UIKit
+import AVFoundation
+import Photos
+
+extension Notification.Name {
+    static let obj3dVideoSaved = Notification.Name("obj3dVideoSaved")
+}
 
 struct CapturedFrame: Codable {
     let file: String
@@ -37,6 +43,19 @@ final class CaptureManager: NSObject, ObservableObject, ARSessionDelegate {
     private var meta: CaptureMeta?                   // 只在 saveQueue 上存取
     private var captureDir: URL?                     // 只在 saveQueue 上存取
 
+    // 同時錄一段一般影片存到「照片」
+    private let videoQueue = DispatchQueue(label: "obj3d.capture.video")
+    private var writer: AVAssetWriter?               // 建立後只在 videoQueue 上存取
+    private var writerInput: AVAssetWriterInput?
+    private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private var videoURL: URL?
+    private var videoStart: TimeInterval?
+    private var lastVideoTime: TimeInterval = 0      // 主執行緒
+    private var videoActive = false                  // 主執行緒
+    private var saveVideoEnabled: Bool {
+        UserDefaults.standard.object(forKey: "saveVideoToPhotos") as? Bool ?? true
+    }
+
     override init() {
         super.init()
         session.delegate = self
@@ -69,12 +88,18 @@ final class CaptureManager: NSObject, ObservableObject, ARSessionDelegate {
         }
         frameCount = 0
         lastSavedTime = 0
+        lastVideoTime = 0
+        videoActive = false
         isRecording = true
     }
 
     /// 結束錄影：等所有影格寫完後寫入 meta.json
     func endRecording(completion: @escaping (URL?, String?, Int) -> Void) {
         isRecording = false
+        if videoActive {
+            videoActive = false
+            finishVideo()
+        }
         saveQueue.async {
             guard let meta = self.meta, let dir = self.captureDir else {
                 DispatchQueue.main.async { completion(nil, nil, 0) }
@@ -96,6 +121,7 @@ final class CaptureManager: NSObject, ObservableObject, ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         updateTracking(frame.camera.trackingState)
         guard isRecording else { return }
+        if saveVideoEnabled { appendVideoFrame(frame) }
         guard case .normal = frame.camera.trackingState else { return }
         guard frame.timestamp - lastSavedTime >= interval, inFlight < 3 else { return }
         lastSavedTime = frame.timestamp
@@ -143,6 +169,81 @@ final class CaptureManager: NSObject, ObservableObject, ARSessionDelegate {
         meta.imageHeight = Int(image.extent.height.rounded())
         self.meta = meta
         return meta.frames.count
+    }
+
+    // MARK: - 一般影片（存到「照片」）
+
+    /// 主執行緒呼叫：約每秒 30 張送進編碼器
+    private func appendVideoFrame(_ frame: ARFrame) {
+        guard frame.timestamp - lastVideoTime >= 1.0 / 30.0 - 0.002 else { return }
+        lastVideoTime = frame.timestamp
+        let pb = frame.capturedImage
+        let ts = frame.timestamp
+        if !videoActive {
+            videoActive = true
+            let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
+            videoQueue.async { self.startVideo(width: w, height: h) }
+        }
+        videoQueue.async { self.appendVideo(pb, at: ts) }
+    }
+
+    private func startVideo(width: Int, height: Int) {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("obj3d_\(UUID().uuidString.prefix(8)).mov")
+        guard let w = try? AVAssetWriter(outputURL: url, fileType: .mov) else { return }
+        let settings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.hevc,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height,
+        ]
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+        input.expectsMediaDataInRealTime = true
+        input.transform = CGAffineTransform(rotationAngle: .pi / 2)      // 感光元件是橫的，轉成直式
+        let ad = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: nil)
+        guard w.canAdd(input) else { return }
+        w.add(input)
+        writer = w; writerInput = input; adaptor = ad; videoURL = url; videoStart = nil
+    }
+
+    private func appendVideo(_ pb: CVPixelBuffer, at ts: TimeInterval) {
+        guard let w = writer, let input = writerInput, let ad = adaptor else { return }
+        if videoStart == nil {
+            guard w.startWriting() else { return }
+            w.startSession(atSourceTime: .zero)
+            videoStart = ts
+        }
+        guard w.status == .writing, input.isReadyForMoreMediaData, let start = videoStart else { return }
+        _ = ad.append(pb, withPresentationTime: CMTime(seconds: ts - start, preferredTimescale: 600))
+    }
+
+    private func finishVideo() {
+        videoQueue.async {
+            guard let w = self.writer, let input = self.writerInput, let url = self.videoURL else { return }
+            self.writer = nil; self.writerInput = nil; self.adaptor = nil; self.videoURL = nil
+            guard w.status == .writing else {
+                try? FileManager.default.removeItem(at: url)
+                return
+            }
+            input.markAsFinished()
+            w.finishWriting {
+                CaptureManager.saveToPhotos(url)
+            }
+        }
+    }
+
+    private static func saveToPhotos(_ url: URL) {
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+            guard status == .authorized || status == .limited else {
+                try? FileManager.default.removeItem(at: url)
+                NotificationCenter.default.post(name: .obj3dVideoSaved, object: false)
+                return
+            }
+            PHPhotoLibrary.shared().performChanges({
+                PHAssetCreationRequest.forAsset().addResource(with: .video, fileURL: url, options: nil)
+            }) { ok, _ in
+                try? FileManager.default.removeItem(at: url)
+                NotificationCenter.default.post(name: .obj3dVideoSaved, object: ok)
+            }
+        }
     }
 
     private func updateTracking(_ state: ARCamera.TrackingState) {

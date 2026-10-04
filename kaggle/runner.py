@@ -5,6 +5,7 @@
 #        preview.bin（App 預覽用）、result_meta.json
 # =====================================================================
 JOB_ID = "__JOB_ID__"
+RUNNER_VERSION = "2026.10.04-tsdf-texture"   # 每次修改運算程式時更新
 SMOOTH_LEVEL = "__SMOOTH__"      # low / medium / high（由 App 設定）
 
 import os, sys, json, time, glob, shutil, subprocess, zipfile, traceback
@@ -35,6 +36,7 @@ def log(*a):
 
 def write_meta(**kw):
     kw.setdefault("jobId", JOB_ID)
+    kw["runner_version"] = RUNNER_VERSION
     kw["elapsed_s"] = round(time.time() - T0, 1)
     kw["warnings"] = WARN
     with open(f"{WORK}/result_meta.json", "w", encoding="utf-8") as f:

@@ -85,4 +85,6 @@ description: 把「下載」資料夾裡最新的 obj3d.zip 套用到這個專�
 
 ## 最後
 
-用一個簡短的清單總結：這次更新了什麼、commit 編號、IPA 的位置、使用者接下來要做的事。
+用一個簡短的清單總結：這次更新了什麼、commit 編號、GitHub 編譯編號（build，即 run number）、IPA 的位置、使用者接下來要做的事。
+提醒使用者：安裝後到 App「設定 → 版本」或主畫面最下方，確認 Build 與 Commit 和這次相同；
+`kaggle/runner.py` 開頭的 `RUNNER_VERSION` 會顯示在「運算程式」欄位。

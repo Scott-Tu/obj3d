@@ -28,6 +28,7 @@ jobs:
           xcodebuild -version
           xcodebuild -project Obj3D.xcodeproj -target Obj3D -configuration Release -sdk iphoneos \
             SYMROOT="$PWD/build" \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" OBJ3D_COMMIT="${GITHUB_SHA:0:7}" \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             build 2>&1 | tee build.log | tail -n 40
 
@@ -37,6 +38,7 @@ jobs:
           cp -R ios/build/Release-iphoneos/Obj3D.app Payload/
           zip -qry Obj3D.ipa Payload
           ls -lh Obj3D.ipa
+          echo "App 版本：$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' Payload/Obj3D.app/Info.plist)（build $(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' Payload/Obj3D.app/Info.plist)，commit $(/usr/libexec/PlistBuddy -c 'Print OBJ3DCommit' Payload/Obj3D.app/Info.plist)）"
 
       - name: 上傳 IPA
         uses: actions/upload-artifact@v4

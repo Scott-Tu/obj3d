@@ -22,6 +22,9 @@ struct ResultMeta: Codable {
     let target_method: String?
     let bad_mask_frames: Int?
     let frames_used: Int?
+    let runner_version: String?
+    let tsdf: Bool?
+    let textured: Bool?
 }
 
 struct JobResult {
@@ -69,7 +72,17 @@ final class JobManager: ObservableObject {
 
     var busy: Bool { phase == .working }
 
+    private var videoObserver: NSObjectProtocol?
+
     init() {
+        videoObserver = NotificationCenter.default.addObserver(forName: .obj3dVideoSaved, object: nil, queue: .main) { [weak self] note in
+            let ok = (note.object as? Bool) ?? false
+            Task { @MainActor in
+                guard let self = self else { return }
+                let msg = ok ? "影片已另存到「照片」" : "影片未能存到「照片」（請到 設定 → 隱私權 → 照片 允許「3D 掃描」加入照片）"
+                self.detail = self.detail.isEmpty ? msg : self.detail + "\n" + msg
+            }
+        }
         let d = UserDefaults.standard
         if let last = d.string(forKey: "lastResultJobId"), let r = JobResult.load(jobId: last) {
             result = r
@@ -308,6 +321,10 @@ final class JobManager: ObservableObject {
             lines.append("物體定位：\(t)" + (r.meta.frames_used.map { "，使用 \($0) 張影格" } ?? ""))
         }
         if let b = r.meta.bad_mask_frames, b > 0 { lines.append("略過 \(b) 張遮罩異常的影格") }
+        var feats: [String] = []
+        if r.meta.tsdf == true { feats.append("TSDF") }
+        if r.meta.textured == true { feats.append("貼圖") }
+        lines.append("運算程式：\(r.meta.runner_version ?? "舊版（無版本資訊）")" + (feats.isEmpty ? "" : "（\(feats.joined(separator: "、"))）"))
         if let w = r.meta.warnings, !w.isEmpty { lines.append("注意：" + w.joined(separator: "；")) }
         detail = lines.joined(separator: "\n")
     }

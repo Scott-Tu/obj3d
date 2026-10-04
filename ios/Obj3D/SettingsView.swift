@@ -4,6 +4,7 @@ struct SettingsView: View {
     @AppStorage("kaggleUsername") private var username = ""
     @AppStorage("machineShape") private var machineShape = "NvidiaTeslaT4"
     @AppStorage("smoothLevel") private var smoothLevel = "medium"
+    @AppStorage("saveVideoToPhotos") private var saveVideoToPhotos = true
     @State private var apiKey = Keychain.get("kaggleKey") ?? ""
     @State private var testing = false
     @State private var testResult = ""
@@ -36,6 +37,11 @@ struct SettingsView: View {
                 }
             }
 
+            Section(header: Text("錄影"),
+                    footer: Text("錄影時同時錄一段一般影片（每秒 30 張）存到「照片」App，第一次會詢問權限。建模用的影格仍另外存在 App 裡。")) {
+                Toggle("同時存影片到「照片」", isOn: $saveVideoToPhotos)
+            }
+
             Section(header: Text("模型"),
                     footer: Text("光滑的物體（杯子、瓶子）選「高」；有細節紋理的物體選「低」。下次生成時套用，不用重拍。")) {
                 Picker("表面平滑度", selection: $smoothLevel) {
@@ -50,6 +56,14 @@ struct SettingsView: View {
                 TextField("GPU 機型", text: $machineShape)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
+            }
+
+            Section(header: Text("版本"),
+                    footer: Text("build 編號是 GitHub 的編譯次數，每次更新都會變大；運算程式版本會寫進每次結果的 result_meta.json。")) {
+                LabeledContent("App 版本", value: AppInfo.version)
+                LabeledContent("Build", value: AppInfo.build)
+                LabeledContent("Commit", value: AppInfo.commit)
+                LabeledContent("運算程式", value: AppInfo.runnerVersion)
             }
 
             Section(header: Text("說明")) {

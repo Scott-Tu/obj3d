@@ -107,6 +107,17 @@ struct ContentView: View {
 
     private var buttons: some View {
         VStack(spacing: 12) {
+            buttonStack
+            Text(AppInfo.summary)
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.top, 4)
+        }
+    }
+
+    private var buttonStack: some View {
+        VStack(spacing: 12) {
             Button {
                 showCapture = true
             } label: {
