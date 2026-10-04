@@ -5,7 +5,7 @@
 #        preview.bin（App 預覽用）、result_meta.json
 # =====================================================================
 JOB_ID = "__JOB_ID__"
-RUNNER_VERSION = "2026.10.06-turntable"   # 每次修改運算程式時更新
+RUNNER_VERSION = "2026.10.07-video-import"   # 每次修改運算程式時更新
 SMOOTH_LEVEL = "__SMOOTH__"      # low / medium / high（由 App 設定）
 
 import os, sys, json, time, glob, shutil, subprocess, zipfile, traceback
@@ -803,6 +803,22 @@ def gravity_up(T_ar_sel, extrinsic):
     return -d, spread
 
 
+def up_from_cameras(extrinsic):
+    """沒有 iPhone 姿態資料時（從「照片」匯入的影片）判斷「上方」：
+    相機繞物體（或物體旋轉）時，相機位置大致在一個水平圓上 → 圓所在平面的法向量就是上下方向；
+    正負號由「畫面上方」平均方向決定（拍攝時手機通常是正拿的）。"""
+    C, fwd, R = cam_centers_dirs(extrinsic)
+    img_up = -R[:, 1, :]
+    u0 = img_up.mean(0); u0 /= np.linalg.norm(u0)
+    c = C.mean(0)
+    _, sv, Vt = np.linalg.svd(C - c, full_matrices=False)
+    n = Vt[2]
+    planar = sv[2] / max(sv[1], 1e-12)
+    if planar < 0.35 and abs(n @ u0) > 0.5:
+        return (n if n @ u0 > 0 else -n), "相機軌跡平面"
+    return u0, "畫面方向"
+
+
 def run_vggt_batches(frame_paths, C_ar, n_batch):
     """分批跑 VGGT（交錯分組），每批各自用 ARKit 軌跡對齊到同一個公尺座標系後合併。"""
     n = len(frame_paths)
@@ -992,7 +1008,8 @@ def main():
     paths = [os.path.join(cap_dir, f["file"]) for f in frames]
     T_ar = np.array([np.array(f["transform"], float).reshape(4, 4).T for f in frames])   # column-major
     C_ar_all = T_ar[:, :3, 3]
-    TT = meta.get("mode") == "turntable"                 # 轉盤模式：物體旋轉、手機大致不動
+    TT = meta.get("mode") in ("turntable", "video")      # 物體旋轉模式，或從「照片」匯入的影片（都沒有可用的手機軌跡）
+    VIDEO = meta.get("mode") == "video"
     span = np.ptp(C_ar_all, axis=0).max()
     if not TT and span < 0.15:
         raise RuntimeError(f"手機移動範圍太小（{span*100:.0f} cm），請繞著物體走一圈；如果是旋轉物體的拍法，請在 App 選「物體旋轉」模式")
@@ -1063,10 +1080,16 @@ def main():
             WARN.append(f"各影格量到的比例尺長度差異 {(max(Ls)-min(Ls))/np.median(Ls):.0%}，尺寸可能不準")
         extrinsic[:, :, 3] *= m_per_unit; depth *= m_per_unit     # 換成公尺
         ruler_pts = ruler_pts * m_per_unit
-        up_tt, g_spread = gravity_up(T_ar[pick], extrinsic)
-        log(f"比例尺：{len(Ls)} 張影格；重力方向一致性 {g_spread:.1f}°")
-        if g_spread > 8:
-            WARN.append(f"重力方向估計的分散度 {g_spread:.0f}°，物體可能不是繞垂直軸旋轉")
+        if VIDEO or np.allclose(T_ar[pick][:, :3, :3], np.eye(3)):
+            up_tt, how = up_from_cameras(extrinsic)
+            log(f"比例尺：{len(Ls)} 張影格；上方方向依據：{how}")
+            if how == "畫面方向":
+                WARN.append("無法從相機軌跡判斷上下方向，改用畫面方向，模型可能稍微傾斜")
+        else:
+            up_tt, g_spread = gravity_up(T_ar[pick], extrinsic)
+            log(f"比例尺：{len(Ls)} 張影格；重力方向一致性 {g_spread:.1f}°")
+            if g_spread > 8:
+                WARN.append(f"重力方向估計的分散度 {g_spread:.0f}°，物體可能不是繞垂直軸旋轉")
         Ccam, fwd, Rcam = cam_centers_dirs(extrinsic)
         frame_ok = np.ones(len(frame_paths), bool); bad_pose = []; rms_cm = 0.0
         log(f"物體定位（{target_method}）：提示影格 {sorted(prompts)}")
@@ -1345,7 +1368,7 @@ def main():
                 params_used=PARAMS_USED,
                 params_summary=("、".join(f"{k}={v}" for k, v in PARAMS_USED.items()) or "全部預設"))
     ext = bp.max(0) - bp.min(0)
-    info.update(mode="turntable" if TT else "orbit")
+    info.update(mode=meta.get("mode") or "orbit")
     info.update(target_method=target_method, prompt_frames=len(prompts), bad_pose_frames=len(bad_pose),
                 batches=int(NB), smooth_level=SMOOTH_LEVEL,
                 consistency_keep=round(float(keepc.mean()), 3),

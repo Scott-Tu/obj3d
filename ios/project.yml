@@ -19,7 +19,7 @@ targets:
       path: Obj3D/Info.plist
       properties:
         CFBundleDisplayName: 3D 掃描
-        CFBundleShortVersionString: "1.9"
+        CFBundleShortVersionString: "2.0"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         OBJ3DCommit: "$(OBJ3D_COMMIT)"
         LSRequiresIPhoneOS: true

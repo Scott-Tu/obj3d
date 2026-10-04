@@ -156,7 +156,7 @@ struct MarkScaleView: View {
 
     private func save() {
         guard var m = meta else { return }
-        m.mode = "turntable"
+        if m.mode != "video" { m.mode = "turntable" }
         m.scale_length_cm = scaleLengthCM
         m.scale_marks = marks.compactMap { fi, pts in
             pts.count == 2 ? ScaleMark(frame: m.frames[fi].file, p1: [pts[0].x, pts[0].y], p2: [pts[1].x, pts[1].y]) : nil

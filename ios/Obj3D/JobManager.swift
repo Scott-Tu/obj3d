@@ -75,7 +75,8 @@ final class JobManager: ObservableObject {
               let data = try? Data(contentsOf: dir.appendingPathComponent("meta.json")) else { return nil }
         return try? JSONDecoder().decode(CaptureMeta.self, from: data)
     }
-    var captureIsTurntable: Bool { currentMeta()?.mode == "turntable" }
+    /// 需要比例尺的拍攝方式：物體旋轉，或從「照片」匯入的影片
+    var captureIsTurntable: Bool { ["turntable", "video"].contains(currentMeta()?.mode ?? "") }
     var captureHasMarks: Bool { !(currentMeta()?.scale_marks ?? []).isEmpty }
 
     func marksSaved() {
@@ -140,7 +141,7 @@ final class JobManager: ObservableObject {
         status = "已錄好 \(frames) 張影格"
         detail = "按「生成 3D 模型」上傳到 Kaggle 運算"
         if captureIsTurntable && !captureHasMarks {
-            status = "已錄好 \(frames) 張影格（物體旋轉模式）"
+            status = currentMeta()?.mode == "video" ? "已匯入 \(frames) 張影格" : "已錄好 \(frames) 張影格（物體旋轉模式）"
             detail = "請先標記比例尺兩端"
             showMarkScale = true
         }
