@@ -5,7 +5,7 @@
 #        preview.bin（App 預覽用）、result_meta.json
 # =====================================================================
 JOB_ID = "__JOB_ID__"
-RUNNER_VERSION = "2026.10.07c-solid-fill"   # 每次修改運算程式時更新
+RUNNER_VERSION = "2026.10.07h-tt-support"   # 每次修改運算程式時更新
 SMOOTH_LEVEL = "__SMOOTH__"      # low / medium / high（由 App 設定）
 
 import os, sys, json, time, glob, shutil, subprocess, zipfile, traceback
@@ -73,6 +73,7 @@ USE_TEXTURE = _flag("use_texture", True)
 USE_HIRES = _flag("use_hires", True)
 DEPTH_REFINE = _flag("depth_refine", True)
 USE_BASE = _flag("use_base", True)
+TT_KEEP_SUPPORT = _flag("tt_keep_support", True)   # 轉盤模式：保留跟著物體轉的底座給 VGGT 定位
 PARAMS_USED = {k: v for k, v in PARAMS.items()
                if k != "capture_fps" and ((isinstance(v, bool) and not v) or (not isinstance(v, bool) and v not in (0, 0.0, None)))}
 
@@ -553,6 +554,7 @@ def run_vggt(paths, mode, with_camera):
     from vggt.utils.load_fn import load_and_preprocess_images
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    log(f"VGGT 運算精度：{dtype}")
     model = VGGT.from_pretrained("facebook/VGGT-1B").to("cuda").eval()
     images = load_and_preprocess_images(paths, mode=mode).to("cuda")
     out = {}
@@ -684,6 +686,16 @@ def run_sam_objects(sel_dir, n, W0, H0, objs):
     from sam2.sam2_video_predictor import SAM2VideoPredictor
     pred = SAM2VideoPredictor.from_pretrained("facebook/sam2.1-hiera-large")
     bf16 = torch.cuda.get_device_capability()[0] >= 8
+    # 保險：SAM 2 會把記憶特徵固定存成 bfloat16，若在 float32 下重跑，先轉回相同 dtype 再進記憶注意力層。
+    def _mem_dtype_fix(_mod, args, kwargs):
+        curr = kwargs.get("curr")
+        ref = curr[0] if isinstance(curr, (list, tuple)) else curr
+        for key in ("memory", "memory_pos"):
+            m = kwargs.get(key)
+            if torch.is_tensor(m) and torch.is_tensor(ref) and m.dtype != ref.dtype:
+                kwargs[key] = m.to(ref.dtype)
+        return args, kwargs
+    pred.memory_attention.register_forward_pre_hook(_mem_dtype_fix, with_kwargs=True)
     def _track(use_bf16):
         masks = {int(o): np.zeros((n, H0, W0), bool) for o in objs}
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
@@ -708,6 +720,42 @@ def run_sam_objects(sel_dir, n, W0, H0, objs):
     del pred
     torch.cuda.empty_cache()
     return masks
+
+
+def find_support_mask(sel_dir, MASKS, H0, W0):
+    """轉盤模式：找出物體正下方、跟著物體一起轉的底座（轉盤、紙張、箱子）。
+    只把物體本身交給 VGGT 時，近似圓柱的物體（例如杯子）幾乎看不出轉了幾度，相機位置會算亂；
+    底座的邊角與花紋會跟著轉，是很好的定位參考。底座只用來算相機位置，不會放進模型。"""
+    n = len(MASKS)
+    empty = np.zeros_like(MASKS)
+    area = MASKS.reshape(n, -1).mean(1)
+    med = float(np.median(area))
+    cand = [i for i in range(n) if 0.5 * med <= area[i] <= 2.0 * med]
+    if not cand:
+        return empty
+    sp = {}
+    for i in sorted(set(np.array(cand)[np.linspace(0, len(cand) - 1, min(4, len(cand))).astype(int)].tolist())):
+        ys, xs = np.nonzero(MASKS[i])
+        h = ys.max() - ys.min()
+        bottom = ys > ys.max() - 0.1 * h
+        xc = int(np.median(xs[bottom]))
+        y = int(ys.max() + max(8, 0.08 * h))
+        if y >= H0 - 2:
+            continue
+        sp[int(i)] = [(float(xc), float(y))]
+    if not sp:
+        log("找底座：物體底部太靠近畫面邊緣，略過")
+        return empty
+    S = run_sam_objects(sel_dir, n, W0, H0, {3: sp})[3] & ~MASKS
+    sa = S.reshape(n, -1).mean(1)
+    k = np.ones((25, 25), np.uint8)
+    touch = [bool(S[i][cv2.dilate(MASKS[i].astype(np.uint8), k) > 0].any()) for i in range(n) if MASKS[i].any()]
+    smed = float(np.median(sa))
+    log(f"找底座：提示影格 {sorted(sp)}，面積中位數 {smed:.1%}，貼著物體的比例 {np.mean(touch):.0%}")
+    if smed > 0.5 or smed < 0.002 or np.mean(touch) < 0.6:
+        log("找底座：結果不像轉盤（太大、太小或沒貼著物體），不使用")
+        return empty
+    return S
 
 
 def run_vggt_batches_anchor(paths, n_batch):
@@ -742,6 +790,8 @@ def run_vggt_batches_anchor(paths, n_batch):
             s, R, t = umeyama(Ca, ref)
             res = np.linalg.norm(s * Ca @ R.T + t - ref, axis=1)
             log(f"第 {b+1} 批錨點對齊殘差（相對單位）中位數 {np.median(res):.4f}")
+            if np.median(res) > 0.05:
+                WARN.append(f"第 {b+1} 批和第 1 批的相機位置對不起來，模型可能破碎")
         if depth is None:
             depth = np.zeros((n,) + v["depth"].shape[1:], np.float32)
             conf = np.zeros_like(depth); imgs = np.zeros((n,) + v["imgs"].shape[1:], np.float32)
@@ -1082,13 +1132,19 @@ def main():
         prompts = {k: v[0] for k, v in obj_prompts.items()}
         mk = run_sam_objects(SEL, len(frame_paths), W0, H0, {1: obj_prompts, 2: ruler_prompts})
         MASKS, RMASK = mk[1], mk[2]
+        SMASK = np.zeros_like(MASKS)
+        if TT_KEEP_SUPPORT:
+            try:
+                SMASK = find_support_mask(SEL, MASKS, H0, W0)
+            except Exception as e:
+                log("找底座失敗，略過：", str(e)[:200])
         MSEL = f"{TMP}/msel"
         shutil.rmtree(MSEL, ignore_errors=True); os.makedirs(MSEL)
         k15 = np.ones((15, 15), np.uint8)
         crop_src = []
         for k, pth in enumerate(frame_paths):
             im = np.asarray(Image.open(pth).convert("RGB")).copy()
-            keepm = cv2.dilate((MASKS[k] | RMASK[k]).astype(np.uint8), k15) > 0
+            keepm = cv2.dilate((MASKS[k] | RMASK[k] | SMASK[k]).astype(np.uint8), k15) > 0
             im[~keepm] = 128                                  # 背景塗成灰色
             q = f"{MSEL}/{k:03d}.jpg"
             Image.fromarray(im).save(q, quality=95)
