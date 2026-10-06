@@ -5,7 +5,7 @@
 #        preview.bin（App 預覽用）、result_meta.json
 # =====================================================================
 JOB_ID = "__JOB_ID__"
-RUNNER_VERSION = "2026.10.08c-3dgs"   # 每次修改運算程式時更新
+RUNNER_VERSION = "2026.10.09-3dgs-clean"   # 每次修改運算程式時更新
 SMOOTH_LEVEL = "__SMOOTH__"      # low / medium / high（由 App 設定）
 
 import os, sys, json, time, glob, shutil, subprocess, zipfile, traceback
@@ -79,6 +79,8 @@ USE_ARKIT = _flag("use_arkit", True)          # 是否使用手機動作追蹤�
 GS_ITERS = int(_p("gs_iters", 7000))
 GS_RES = int(_p("gs_res", 1280))
 GS_MAX = int(_p("gs_max_gaussians", 400_000))
+GS_CLEAN = _flag("gs_clean", True)              # 去毛邊：剔除輪廓外的漂浮點、針狀與太淡的高斯
+GS_MIN_OPACITY = _p("gs_min_opacity", 0.05)
 PARAMS_USED = {k: v for k, v in PARAMS.items()
                if k != "capture_fps" and ((isinstance(v, bool) and not v) or (not isinstance(v, bool) and v not in (0, 0.0, None)))}
 
@@ -919,17 +921,20 @@ def train_3dgs(frame_paths, masks, viewmats, Ks, W0, H0, ds, P0, C0, iters, log_
     from gsplat.strategy import DefaultStrategy
     dev = "cuda"
     Wt, Ht = int(round(W0 * ds)), int(round(H0 * ds))
-    IMG, MSK = [], []
+    IMG, MSK, MSKA = [], [], []
     for p, m in zip(frame_paths, masks):
         IMG.append(torch.from_numpy(np.asarray(Image.open(p).convert("RGB").resize((Wt, Ht)), np.float32) / 255))
         mm = cv2.resize(cv2.dilate(m.astype(np.uint8), np.ones((5, 5), np.uint8)), (Wt, Ht), interpolation=cv2.INTER_NEAREST)
         MSK.append(torch.from_numpy(mm.astype(np.float32))[..., None])
+        ma = cv2.resize(m.astype(np.uint8), (Wt, Ht), interpolation=cv2.INTER_AREA).astype(np.float32)   # 透明度目標：不外擴、邊緣柔和
+        MSKA.append(torch.from_numpy(ma)[..., None])
     VM = [torch.tensor(v, dtype=torch.float32) for v in viewmats]
     KS = [torch.tensor(k, dtype=torch.float32) for k in Ks]
     cam_c = np.array([-(v[:3, :3].T @ v[:3, 3]) for v in viewmats])
     scene_scale = float(np.linalg.norm(cam_c - cam_c.mean(0), axis=1).max()) * 1.1
     N = len(P0)
     d3 = cKDTree(P0).query(P0, k=4)[0][:, 1:].mean(1)
+    obj_size = float((np.percentile(P0, 98, 0) - np.percentile(P0, 2, 0)).max())
     params = torch.nn.ParameterDict({
         "means": torch.nn.Parameter(torch.tensor(P0, dtype=torch.float32, device=dev)),
         "scales": torch.nn.Parameter(torch.log(torch.tensor(np.clip(d3, 1e-3, None), dtype=torch.float32, device=dev))[:, None].repeat(1, 3)),
@@ -958,7 +963,7 @@ def train_3dgs(frame_paths, masks, viewmats, Ks, W0, H0, ds, P0, C0, iters, log_
     rng = np.random.default_rng(1); t0 = time.time()
     for step in range(iters):
         j = int(rng.integers(len(IMG)))
-        img, msk = IMG[j].to(dev), MSK[j].to(dev)
+        img, msk, mska = IMG[j].to(dev), MSK[j].to(dev), MSKA[j].to(dev)
         rc, ra, info = rasterization(means=params["means"], quats=params["quats"], scales=torch.exp(params["scales"]),
                                      opacities=torch.sigmoid(params["opacities"]),
                                      colors=torch.cat([params["sh0"], params["shN"]], 1),
@@ -967,7 +972,11 @@ def train_3dgs(frame_paths, masks, viewmats, Ks, W0, H0, ds, P0, C0, iters, log_
         strat.step_pre_backward(params, opts, st, step, info)
         tgt = img * msk
         loss = 0.8 * (rc[0] - tgt).abs().mean() + 0.2 * (1 - ssim(rc[0].permute(2, 0, 1)[None], tgt.permute(2, 0, 1)[None]))
-        loss = loss + 0.1 * (ra[0] - msk).abs().mean()
+        loss = loss + 0.3 * (ra[0] - mska).abs().mean()                 # 物體外要透明（不外擴的遮罩）
+        sc_ = torch.exp(params["scales"])
+        smax, smin = sc_.max(1).values, sc_.min(1).values.clamp_min(1e-6)
+        loss = loss + 0.01 * TF.relu(smax / smin - 10).mean()          # 抑制細長的針狀高斯
+        loss = loss + 0.1 * TF.relu(smax - 0.03 * obj_size).mean() / max(obj_size, 1e-6)   # 單一高斯不要太大
         loss.backward()
         for o in opts.values():
             o.step(); o.zero_grad(set_to_none=True)
@@ -979,6 +988,29 @@ def train_3dgs(frame_paths, masks, viewmats, Ks, W0, H0, ds, P0, C0, iters, log_
     del params, opts, IMG, MSK
     torch.cuda.empty_cache()
     return out
+
+
+def clean_gaussians(g, viewmats, Ks, masks, W0, H0, ds, min_opacity=0.05, min_out=3):
+    """去毛邊：(1) 中心點在 min_out 張以上畫面落在物體輪廓外 → 漂浮點；(2) 太淡；(3) 又大又細長的針狀"""
+    Wt, Ht = int(round(W0 * ds)), int(round(H0 * ds))
+    m = g["means"]
+    outside = np.zeros(len(m), np.int32)
+    k5 = np.ones((5, 5), np.uint8)
+    for V, K, mk in zip(viewmats, Ks, masks):
+        md = cv2.resize(cv2.dilate(mk.astype(np.uint8), k5), (Wt, Ht), interpolation=cv2.INTER_NEAREST) > 0
+        Xc = m @ V[:3, :3].T + V[:3, 3]
+        z = Xc[:, 2]; ok = z > 1e-6; zs = np.where(ok, z, 1)
+        u = np.round(K[0, 0] * Xc[:, 0] / zs + K[0, 2]).astype(int); v = np.round(K[1, 1] * Xc[:, 1] / zs + K[1, 2]).astype(int)
+        ok &= (u >= 0) & (u < Wt) & (v >= 0) & (v < Ht)
+        ii = np.nonzero(ok)[0]
+        outside[ii] += ~md[v[ii], u[ii]]
+    op = 1 / (1 + np.exp(-g["opacities"]))
+    s = np.exp(g["scales"]); smax, smin = s.max(1), np.maximum(s.min(1), 1e-9)
+    needle = (smax / smin > 25) & (smax > 3 * np.median(smax))
+    keep = (outside < min_out) & (op >= min_opacity) & ~needle
+    log(f"3DGS 去毛邊：輪廓外 {int((outside >= min_out).sum()):,}、太淡 {int((op < min_opacity).sum()):,}、"
+        f"針狀 {int(needle.sum()):,}，保留 {keep.mean():.0%}")
+    return {k: v[keep] for k, v in g.items()}
 
 
 def export_gaussians(g, max_n, ply_path, splat_path):
@@ -1658,6 +1690,8 @@ def main():
             P0, C0 = np.asarray(spc.points), np.clip(np.asarray(spc.colors), 0, 1)
             log(f"3DGS 訓練：{len(ok_ids)} 張影像（{int(W0 * ds)}×{int(H0 * ds)}），{GS_ITERS} 步，初始 {len(P0):,} 點")
             g = train_3dgs([frame_paths[i] for i in ok_ids], [MASKS[i] for i in ok_ids], VMs, KSs, W0, H0, ds, P0, C0, GS_ITERS)
+            if GS_CLEAN:
+                g = clean_gaussians(g, VMs, KSs, [MASKS[i] for i in ok_ids], W0, H0, ds, GS_MIN_OPACITY)
             n_out = export_gaussians(g, GS_MAX, f"{WORK}/gaussians.ply", f"{WORK}/model.splat")
             gs_info = dict(gs=True, gs_count=int(n_out), gs_mb=round(os.path.getsize(f"{WORK}/model.splat") / 1e6, 1))
             log(f"3DGS 完成：{n_out:,} 個元素，model.splat {gs_info['gs_mb']} MB")

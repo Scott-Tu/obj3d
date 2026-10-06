@@ -33,7 +33,7 @@
       selfDrivenMode: true,
     });
     await viewer.addSplatScene("app://result/model.splat", {
-      format: GS.SceneFormat.Splat, showLoadingUI: false, progressiveLoad: false, splatAlphaRemovalThreshold: 5,
+      format: GS.SceneFormat.Splat, showLoadingUI: false, progressiveLoad: false, splatAlphaRemovalThreshold: 15,
     });
     msg.remove();
     viewer.start();
