@@ -5,7 +5,7 @@ struct ContentView: View {
     @State private var showCapture = false
     @State private var showLibrary = false
     @State private var showRuler = true
-    @AppStorage("captureMode") private var captureMode = "orbit"
+    @State private var viewMode = 0          // 0 = 3DGS 擬真，1 = 網格（尺寸）
 
     var body: some View {
         NavigationStack {
@@ -36,7 +36,7 @@ struct ContentView: View {
                 CaptureLibraryView().environmentObject(job)
             }
             .fullScreenCover(isPresented: $showCapture) {
-                CaptureView(mode: captureMode) { url, jobId, count in
+                CaptureView(mode: "orbit") { url, jobId, count in
                     job.setCapture(url: url, jobId: jobId, frames: count)
                 }
             }
@@ -47,12 +47,30 @@ struct ContentView: View {
     private var previewArea: some View {
         if let r = job.result {
             VStack(spacing: 10) {
-                ModelViewer(url: r.previewURL, showRuler: showRuler)
-                    .id(r.jobId)
-                    .frame(height: 380)
-                    .clipShape(RoundedRectangle(cornerRadius: 16))
-                Toggle("顯示公分尺規", isOn: $showRuler)
-                    .padding(.horizontal, 4)
+                if r.splatURL != nil {
+                    Picker("檢視", selection: $viewMode) {
+                        Text("擬真（3DGS）").tag(0)
+                        Text("網格（尺寸）").tag(1)
+                    }
+                    .pickerStyle(.segmented)
+                }
+                if r.splatURL != nil && viewMode == 0 {
+                    let maxCM = (r.meta.size_cm ?? [10, 10, 10]).max() ?? 10
+                    SplatViewer(resultDir: r.dir, cameraDistance: max(0.15, maxCM / 100 * 2.2),
+                                lookHeight: ((r.meta.size_cm?.last ?? 10) / 100) * 0.45)
+                        .id(r.jobId + "-gs")
+                        .frame(height: 380)
+                        .clipShape(RoundedRectangle(cornerRadius: 16))
+                    Text("單指旋轉、雙指縮放平移；第一次開啟需要網路載入檢視器")
+                        .font(.caption2).foregroundColor(.secondary)
+                } else {
+                    ModelViewer(url: r.previewURL, showRuler: showRuler)
+                        .id(r.jobId)
+                        .frame(height: 380)
+                        .clipShape(RoundedRectangle(cornerRadius: 16))
+                    Toggle("顯示公分尺規", isOn: $showRuler)
+                        .padding(.horizontal, 4)
+                }
                 if !r.shareFiles.isEmpty {
                     ShareLink(items: r.shareFiles) {
                         Label("分享／儲存模型檔（GLB、STL、PLY）", systemImage: "square.and.arrow.up")
@@ -124,15 +142,7 @@ struct ContentView: View {
 
     private var buttonStack: some View {
         VStack(spacing: 12) {
-            Picker("拍攝方式", selection: $captureMode) {
-                Text("手機繞物體").tag("orbit")
-                Text("物體旋轉").tag("turntable")
-            }
-            .pickerStyle(.segmented)
-            .disabled(job.busy)
-            Text(captureMode == "orbit"
-                 ? "物體不動，拿著手機繞物體一圈；尺寸由手機的動作追蹤換算。"
-                 : "手機大致不動，旋轉物體（例如放在轉盤上）；需要在轉盤上放一支已知長度的比例尺。")
+            Text("物體不動，拿著手機繞物體慢慢走一圈（再從斜上方一圈）。可在畫面中放一支已知長度的比例尺，錄完標記兩端讓尺寸更準。")
                 .font(.footnote).foregroundColor(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -155,11 +165,11 @@ struct ContentView: View {
             .controlSize(.large)
             .disabled(job.busy || job.captureURL == nil)
 
-            if job.captureURL != nil && job.captureIsTurntable {
+            if job.captureURL != nil {
                 Button {
                     job.showMarkScale = true
                 } label: {
-                    Label(job.captureHasMarks ? "重新標記比例尺" : "標記比例尺（必要）", systemImage: "ruler")
+                    Label(job.captureHasMarks ? "重新標記比例尺" : "標記比例尺（建議）", systemImage: "ruler")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)

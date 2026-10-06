@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #f2f2f7; }
+  #msg { position: absolute; top: 45%; width: 100%; text-align: center; font: 15px -apple-system, sans-serif; color: #666; }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "@mkkellogg/gaussian-splats-3d": "https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4/build/gaussian-splats-3d.module.js"
+} }
+</script>
+</head>
+<body>
+<div id="msg">載入 3DGS 模型中…</div>
+<script type="module">
+  const q = new URLSearchParams(location.search);
+  const r = parseFloat(q.get("r") || "0.3");      // 相機距離（公尺）
+  const cy = parseFloat(q.get("cy") || "0.05");   // 看向的高度（公尺）
+  const msg = document.getElementById("msg");
+  try {
+    const GS = await import("@mkkellogg/gaussian-splats-3d");
+    const viewer = new GS.Viewer({
+      cameraUp: [0, 1, 0],
+      initialCameraPosition: [r * 0.7, cy + r * 0.55, r * 0.9],
+      initialCameraLookAt: [0, cy, 0],
+      sharedMemoryForWorkers: false,
+      gpuAcceleratedSort: false,
+      dynamicScene: false,
+      selfDrivenMode: true,
+    });
+    await viewer.addSplatScene("app://result/model.splat", {
+      format: GS.SceneFormat.Splat, showLoadingUI: false, progressiveLoad: false, splatAlphaRemovalThreshold: 5,
+    });
+    msg.remove();
+    viewer.start();
+  } catch (e) {
+    msg.textContent = "無法載入 3DGS 模型：" + e + "（需要網路連線來載入檢視器）";
+  }
+</script>
+</body>
+</html>

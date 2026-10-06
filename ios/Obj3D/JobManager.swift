@@ -26,6 +26,12 @@ struct ResultMeta: Codable {
     let tsdf: Bool?
     let textured: Bool?
     let params_summary: String?
+    let gs: Bool?
+    let gs_count: Int?
+    let gs_mb: Double?
+    let scale_source: String?
+    let ruler_vs_arkit: Double?
+    let use_arkit: Bool?
     let smooth_level: String?
 }
 
@@ -35,14 +41,18 @@ struct JobResult {
     let meta: ResultMeta
 
     var previewURL: URL { dir.appendingPathComponent("preview.bin") }
+    var splatURL: URL? {
+        let u = dir.appendingPathComponent("model.splat")
+        return FileManager.default.fileExists(atPath: u.path) ? u : nil
+    }
     var shareFiles: [URL] {
-        ["model.glb", "model_mm.stl", "model_mm.ply"]
+        ["model.glb", "model_mm.stl", "model_mm.ply", "model.splat"]
             .map { dir.appendingPathComponent($0) }
             .filter { FileManager.default.fileExists(atPath: $0.path) }
     }
 
     var diagnosticImages: [URL] {
-        ["diag_masks.jpg", "diag_cameras.png"]
+        ["diag_masks.jpg", "diag_cameras.png", "model.splat"]
             .map { dir.appendingPathComponent($0) }
             .filter { FileManager.default.fileExists(atPath: $0.path) }
     }
@@ -75,9 +85,13 @@ final class JobManager: ObservableObject {
               let data = try? Data(contentsOf: dir.appendingPathComponent("meta.json")) else { return nil }
         return try? JSONDecoder().decode(CaptureMeta.self, from: data)
     }
-    /// 需要比例尺的拍攝方式：物體旋轉，或從「照片」匯入的影片
-    var captureIsTurntable: Bool { ["turntable", "video"].contains(currentMeta()?.mode ?? "") }
-    var captureHasMarks: Bool { !(currentMeta()?.scale_marks ?? []).isEmpty }
+    /// 需要比例尺：物體旋轉、從「照片」匯入的影片，或關閉 ARKit 時的手機繞物體
+    var captureIsTurntable: Bool {
+        let mode = currentMeta()?.mode ?? "orbit"
+        return ["turntable", "video"].contains(mode) || (mode == "orbit" && DevParams.value(forKey: "use_arkit") == 0)
+    }
+    var minMarksNeeded: Int { (currentMeta()?.mode ?? "orbit") == "orbit" ? 2 : 1 }
+    var captureHasMarks: Bool { (currentMeta()?.scale_marks ?? []).count >= minMarksNeeded }
 
     func marksSaved() {
         objectWillChange.send()
@@ -141,8 +155,11 @@ final class JobManager: ObservableObject {
         status = "已錄好 \(frames) 張影格"
         detail = "按「生成 3D 模型」上傳到 Kaggle 運算"
         if captureIsTurntable && !captureHasMarks {
-            status = currentMeta()?.mode == "video" ? "已匯入 \(frames) 張影格" : "已錄好 \(frames) 張影格（物體旋轉模式）"
-            detail = "請先標記比例尺兩端"
+            status = currentMeta()?.mode == "video" ? "已匯入 \(frames) 張影格" : "已錄好 \(frames) 張影格"
+            detail = "建議標記比例尺兩端（至少 \(minMarksNeeded) 張畫面）；不標記也能生成，但沒有真實尺寸"
+            showMarkScale = true
+        } else if !captureHasMarks {
+            detail = "建議標記比例尺兩端（2~4 張畫面），尺寸會更準；也可以直接生成"
             showMarkScale = true
         }
     }
@@ -198,9 +215,7 @@ final class JobManager: ObservableObject {
         setBusy(true)
         defer { setBusy(false) }
         if captureIsTurntable && !captureHasMarks {
-            fail("物體旋轉模式需要先標記比例尺兩端")
-            showMarkScale = true
-            return
+            detail = "沒有比例尺、也沒有使用手機位置：模型會是相對比例（沒有真實尺寸）"
         }
         do {
             let jobId = try CaptureStore.assignNewJobId(dir)     // 同一段錄影可以重複生成
@@ -333,7 +348,7 @@ final class JobManager: ObservableObject {
         let dir = AppPaths.results.appendingPathComponent(jobId)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let wanted = ["result_meta.json", "preview.bin", "preview_tex.jpg", "model.glb", "model_mm.stl", "model_mm.ply",
-                      "diag_masks.jpg", "diag_cameras.png"]
+                      "diag_masks.jpg", "diag_cameras.png", "model.splat"]
         for name in wanted {
             if let f = files.first(where: { ($0.name as NSString).lastPathComponent == name }) {
                 detail = name
@@ -348,7 +363,7 @@ final class JobManager: ObservableObject {
         UserDefaults.standard.set(jobId, forKey: "lastResultJobId")
         status = "完成！"
         var lines: [String] = []
-        if let s = r.meta.size_cm, s.count == 3 {
+        if let s = r.meta.size_cm, s.count == 3, r.meta.scale_source != "none" {
             lines.append(String(format: "尺寸：寬 %.1f × 深 %.1f × 高 %.1f cm", s[0], s[1], s[2]))
         }
         lines.append(r.meta.watertight == true ? "封閉無破孔 ✅" : "⚠️ 模型未完全封閉")
@@ -360,6 +375,14 @@ final class JobManager: ObservableObject {
         if r.meta.tsdf == true { feats.append("TSDF") }
         if r.meta.textured == true { feats.append("貼圖") }
         lines.append("運算程式：\(r.meta.runner_version ?? "舊版（無版本資訊）")" + (feats.isEmpty ? "" : "（\(feats.joined(separator: "、"))）"))
+        if r.meta.gs == true, let n = r.meta.gs_count {
+            lines.append("3DGS 擬真模型：\(n / 1000) 千個元素" + (r.meta.gs_mb.map { String(format: "（%.1f MB）", $0) } ?? ""))
+        }
+        if let src = r.meta.scale_source {
+            var t = "尺寸依據：" + (src == "ruler" ? "比例尺" : (src == "none" ? "無（相對比例，最大邊＝10，單位不是公分）" : "手機位置（ARKit）"))
+            if let d = r.meta.ruler_vs_arkit { t += String(format: "（比例尺與 ARKit 相差 %+.1f%%）", d * 100) }
+            lines.append(t)
+        }
         if let p = r.meta.params_summary { lines.append("參數：\(p)、平滑度 \(r.meta.smooth_level ?? "?")") }
         if let w = r.meta.warnings, !w.isEmpty { lines.append("注意：" + w.joined(separator: "；")) }
         detail = lines.joined(separator: "\n")

@@ -97,3 +97,12 @@ iOS App 必須在 Mac 上編譯，這裡借用 GitHub 免費提供的雲端 Mac�
 專案內附 `.claude/skills/update-app/`。在專案資料夾開啟 Claude Code 後輸入 `/update-app`，
 它會自動：找到「下載」裡最新的 obj3d.zip → 套用 → Commit、Push → 等 GitHub 編譯 → 下載 Obj3D.ipa 並開啟 Sideloadly。
 最後用 Sideloadly 安裝到 iPhone 仍需手動（需要你的 Apple ID）。
+
+
+## 七、2.1 版：手機繞物體＋3DGS 擬真模型
+
+- 拍攝方式統一為「手機繞物體」（另保留「從照片匯入影片」）。
+- 錄完可標記比例尺兩端（2~4 張畫面，長度在設定中調整）；尺寸依據可選 ARKit／比例尺（開發者參數）。
+- 開發者參數「使用手機動作追蹤（ARKit）」可關閉：相機位置只由畫面推算，尺寸用比例尺；兩者都沒有時輸出相對比例模型。
+- Kaggle 會額外訓練 3DGS 擬真模型（model.splat 傳回手機檢視；完整的 gaussians.ply 在 Kaggle 的 Output，可用電腦開啟）。
+- App 結果頁可切換「擬真（3DGS）」與「網格（尺寸）」。3DGS 檢視器第一次開啟需要網路。

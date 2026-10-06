@@ -5,7 +5,7 @@
 #        preview.bin（App 預覽用）、result_meta.json
 # =====================================================================
 JOB_ID = "__JOB_ID__"
-RUNNER_VERSION = "2026.10.07c-solid-fill"   # 每次修改運算程式時更新
+RUNNER_VERSION = "2026.10.08c-3dgs"   # 每次修改運算程式時更新
 SMOOTH_LEVEL = "__SMOOTH__"      # low / medium / high（由 App 設定）
 
 import os, sys, json, time, glob, shutil, subprocess, zipfile, traceback
@@ -73,6 +73,12 @@ USE_TEXTURE = _flag("use_texture", True)
 USE_HIRES = _flag("use_hires", True)
 DEPTH_REFINE = _flag("depth_refine", True)
 USE_BASE = _flag("use_base", True)
+SCALE_SOURCE = {0: "auto", 1: "arkit", 2: "ruler"}.get(int(_p("scale_source", 0)), "auto")
+USE_GS = _flag("gs_enable", True)
+USE_ARKIT = _flag("use_arkit", True)          # 是否使用手機動作追蹤（ARKit）的位置資料
+GS_ITERS = int(_p("gs_iters", 7000))
+GS_RES = int(_p("gs_res", 1280))
+GS_MAX = int(_p("gs_max_gaussians", 400_000))
 PARAMS_USED = {k: v for k, v in PARAMS.items()
                if k != "capture_fps" and ((isinstance(v, bool) and not v) or (not isinstance(v, bool) and v not in (0, 0.0, None)))}
 
@@ -840,6 +846,168 @@ def up_from_cameras(extrinsic):
     return u0, "畫面方向"
 
 
+def frame_support(extrinsic, intrinsic, depth, masks, box, stride=6, tol=0.03, n_ref=20):
+    """不靠 ARKit 的相機位置檢查：每張畫面的物體點，有多少比例能在其他畫面找到吻合的深度。
+    相機位置算錯的畫面，比例會明顯偏低。"""
+    padL, padT, nw, nh = box
+    S = len(depth)
+    refs = np.linspace(0, S - 1, min(n_ref, S)).astype(int)
+    frac = np.full(S, np.nan)
+    for i in range(S):
+        if not masks[i].any():
+            continue
+        g = np.zeros(depth.shape[1:], bool)
+        g[padT:padT + nh, padL:padL + nw] = cv2.resize(masks[i].astype(np.uint8), (nw, nh), interpolation=cv2.INTER_NEAREST) > 0
+        g &= depth[i] > 0
+        vv, uu = np.nonzero(g[::stride, ::stride]); uu = uu * stride; vv = vv * stride
+        if len(uu) < 30:
+            continue
+        z = depth[i][vv, uu]; K = intrinsic[i]
+        Xc = np.stack([(uu - K[0, 2]) * z / K[0, 0], (vv - K[1, 2]) * z / K[1, 1], z], 1)
+        P = (Xc - extrinsic[i][:, 3]) @ extrinsic[i][:, :3]
+        sup = np.zeros(len(P), int)
+        for j in refs:
+            if j == i:
+                continue
+            Y = P @ extrinsic[j][:, :3].T + extrinsic[j][:, 3]
+            zj = Y[:, 2]; Kj = intrinsic[j]; ok = zj > 1e-9
+            zs = np.where(ok, zj, 1)
+            ui = np.round(Kj[0, 0] * Y[:, 0] / zs + Kj[0, 2]).astype(int); vi = np.round(Kj[1, 1] * Y[:, 1] / zs + Kj[1, 2]).astype(int)
+            ok &= (ui >= padL) & (ui < padL + nw) & (vi >= padT) & (vi < padT + nh)
+            idx = np.nonzero(ok)[0]
+            d = depth[j][vi[idx], ui[idx]]
+            sup[idx[(d > 0) & (np.abs(zj[idx] - d) < tol * d)]] += 1
+        frac[i] = float(np.mean(sup >= 2))
+    return frac
+
+
+def ruler_triangulate(marks_sel, extrinsic, intrinsic, sx, sy, padL, padT):
+    """比例尺兩端在 2 張以上畫面的點選 → 三角測量出 3D 端點（世界座標）。自動處理某張點反順序。"""
+    import itertools
+    def ray(fi, q):
+        u, v = (q[0] + 0.5) * sx - 0.5 + padL, (q[1] + 0.5) * sy - 0.5 + padT
+        R_ = extrinsic[fi][:, :3].astype(np.float64); t_ = extrinsic[fi][:, 3].astype(np.float64)
+        d = R_.T @ (np.linalg.inv(intrinsic[fi].astype(np.float64)) @ np.array([u, v, 1.0]))
+        return -R_.T @ t_, d / np.linalg.norm(d)
+    def dist(P, rays):
+        return np.mean([np.linalg.norm((P - c) - ((P - c) @ d) * d) for c, d in rays])
+    best = None
+    for flips in itertools.product([0, 1], repeat=len(marks_sel) - 1):
+        fl = (0,) + flips
+        Ar = [ray(fi, (p1, p2)[f]) for (fi, p1, p2), f in zip(marks_sel, fl)]
+        Br = [ray(fi, (p1, p2)[1 - f]) for (fi, p1, p2), f in zip(marks_sel, fl)]
+        A_ = nearest_point_to_lines(np.array([c for c, _ in Ar]), np.array([d for _, d in Ar]))
+        B_ = nearest_point_to_lines(np.array([c for c, _ in Br]), np.array([d for _, d in Br]))
+        res = dist(A_, Ar) + dist(B_, Br)
+        if best is None or res < best[0]:
+            best = (res, A_, B_, Ar)
+    res, A_, B_, Ar = best
+    ang = max(np.degrees(np.arccos(np.clip(abs(d1 @ d2), -1, 1))) for (_, d1), (_, d2) in itertools.combinations(Ar, 2))
+    return A_, B_, res / max(np.linalg.norm(A_ - B_), 1e-12), ang
+
+
+def _qmul(a, b):
+    w1, x1, y1, z1 = a.T; w2, x2, y2, z2 = b.T
+    return np.stack([w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2, w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                     w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2, w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2], 1)
+
+
+def train_3dgs(frame_paths, masks, viewmats, Ks, W0, H0, ds, P0, C0, iters, log_every=1000):
+    """以 gsplat 訓練 3DGS（只學物體：物體外要透明）。座標單位：公分（轉正後，z 軸朝上）"""
+    import torch, torch.nn.functional as TF
+    from gsplat import rasterization
+    from gsplat.strategy import DefaultStrategy
+    dev = "cuda"
+    Wt, Ht = int(round(W0 * ds)), int(round(H0 * ds))
+    IMG, MSK = [], []
+    for p, m in zip(frame_paths, masks):
+        IMG.append(torch.from_numpy(np.asarray(Image.open(p).convert("RGB").resize((Wt, Ht)), np.float32) / 255))
+        mm = cv2.resize(cv2.dilate(m.astype(np.uint8), np.ones((5, 5), np.uint8)), (Wt, Ht), interpolation=cv2.INTER_NEAREST)
+        MSK.append(torch.from_numpy(mm.astype(np.float32))[..., None])
+    VM = [torch.tensor(v, dtype=torch.float32) for v in viewmats]
+    KS = [torch.tensor(k, dtype=torch.float32) for k in Ks]
+    cam_c = np.array([-(v[:3, :3].T @ v[:3, 3]) for v in viewmats])
+    scene_scale = float(np.linalg.norm(cam_c - cam_c.mean(0), axis=1).max()) * 1.1
+    N = len(P0)
+    d3 = cKDTree(P0).query(P0, k=4)[0][:, 1:].mean(1)
+    params = torch.nn.ParameterDict({
+        "means": torch.nn.Parameter(torch.tensor(P0, dtype=torch.float32, device=dev)),
+        "scales": torch.nn.Parameter(torch.log(torch.tensor(np.clip(d3, 1e-3, None), dtype=torch.float32, device=dev))[:, None].repeat(1, 3)),
+        "quats": torch.nn.Parameter(TF.normalize(torch.randn(N, 4, device=dev), dim=-1)),
+        "opacities": torch.nn.Parameter(torch.logit(torch.full((N,), 0.1, device=dev))),
+        "sh0": torch.nn.Parameter(torch.tensor((C0 - 0.5) / 0.28209479177387814, dtype=torch.float32, device=dev)[:, None, :]),
+        "shN": torch.nn.Parameter(torch.zeros(N, 15, 3, device=dev)),
+    })
+    lrs = dict(means=1.6e-4 * scene_scale, scales=5e-3, quats=1e-3, opacities=5e-2, sh0=2.5e-3, shN=2.5e-3 / 20)
+    opts = {k: torch.optim.Adam([{"params": params[k], "lr": lrs[k], "name": k}], eps=1e-15) for k in lrs}
+    strat = DefaultStrategy(verbose=False, refine_start_iter=500, refine_stop_iter=int(iters * 0.6),
+                            reset_every=max(1000, int(iters * 0.4)), refine_every=100)
+    strat.check_sanity(params, opts)
+    st = strat.initialize_state(scene_scale=scene_scale)
+    sched = torch.optim.lr_scheduler.ExponentialLR(opts["means"], gamma=0.01 ** (1.0 / iters))
+
+    def ssim(x, y):
+        C1, C2 = 0.01 ** 2, 0.03 ** 2
+        g = torch.exp(-(torch.arange(11, device=x.device, dtype=torch.float32) - 5) ** 2 / (2 * 1.5 ** 2)); g = g / g.sum()
+        k = (g[:, None] * g[None, :]).expand(3, 1, 11, 11).contiguous()
+        f = lambda t: TF.conv2d(t, k, padding=5, groups=3)
+        mx, my = f(x), f(y)
+        vx, vy, cxy = f(x * x) - mx ** 2, f(y * y) - my ** 2, f(x * y) - mx * my
+        return (((2 * mx * my + C1) * (2 * cxy + C2)) / ((mx ** 2 + my ** 2 + C1) * (vx + vy + C2))).mean()
+
+    rng = np.random.default_rng(1); t0 = time.time()
+    for step in range(iters):
+        j = int(rng.integers(len(IMG)))
+        img, msk = IMG[j].to(dev), MSK[j].to(dev)
+        rc, ra, info = rasterization(means=params["means"], quats=params["quats"], scales=torch.exp(params["scales"]),
+                                     opacities=torch.sigmoid(params["opacities"]),
+                                     colors=torch.cat([params["sh0"], params["shN"]], 1),
+                                     viewmats=VM[j][None].to(dev), Ks=KS[j][None].to(dev), width=Wt, height=Ht,
+                                     sh_degree=min(step // 1000, 3), packed=False)
+        strat.step_pre_backward(params, opts, st, step, info)
+        tgt = img * msk
+        loss = 0.8 * (rc[0] - tgt).abs().mean() + 0.2 * (1 - ssim(rc[0].permute(2, 0, 1)[None], tgt.permute(2, 0, 1)[None]))
+        loss = loss + 0.1 * (ra[0] - msk).abs().mean()
+        loss.backward()
+        for o in opts.values():
+            o.step(); o.zero_grad(set_to_none=True)
+        sched.step()
+        strat.step_post_backward(params, opts, st, step, info, packed=False)
+        if step % log_every == 0 or step == iters - 1:
+            log(f"3DGS {step}/{iters}  loss {loss.item():.4f}  元素 {len(params['means']):,}  {time.time() - t0:.0f}s")
+    out = {k: v.detach().cpu().numpy() for k, v in params.items()}
+    del params, opts, IMG, MSK
+    torch.cuda.empty_cache()
+    return out
+
+
+def export_gaussians(g, max_n, ply_path, splat_path):
+    """匯出：完整 .ply（INRIA 格式，給電腦）＋精簡 .splat（每個 32 bytes，給手機）。座標：公尺、y 軸朝上（與 GLB 相同）"""
+    m = g["means"] * 0.01; s = g["scales"] + np.log(0.01)
+    q = g["quats"] / np.linalg.norm(g["quats"], axis=1, keepdims=True)
+    o = g["opacities"]; f0 = g["sh0"][:, 0, :]; fr = g["shN"].transpose(0, 2, 1).reshape(len(m), -1)
+    imp = 1 / (1 + np.exp(-o)) * np.exp(s.sum(1))
+    order = np.argsort(-imp)[:max_n]
+    m, s, q, o, f0, fr = m[order], s[order], q[order], o[order], f0[order], fr[order]
+    m = np.stack([m[:, 0], m[:, 2], -m[:, 1]], 1)                      # z 朝上 → y 朝上
+    qx = np.array([[np.cos(-np.pi / 4), np.sin(-np.pi / 4), 0, 0]])     # 繞 x 軸 -90°
+    q = _qmul(np.repeat(qx, len(q), 0), q)
+    names = ["x", "y", "z", "nx", "ny", "nz"] + [f"f_dc_{i}" for i in range(3)] + [f"f_rest_{i}" for i in range(fr.shape[1])] + \
+            ["opacity"] + [f"scale_{i}" for i in range(3)] + [f"rot_{i}" for i in range(4)]
+    data = np.concatenate([m, np.zeros_like(m), f0, fr, o[:, None], s, q], 1).astype(np.float32)
+    with open(ply_path, "wb") as fh:
+        fh.write(("ply\nformat binary_little_endian 1.0\nelement vertex %d\n" % len(data)).encode())
+        fh.write("".join(f"property float {n}\n" for n in names).encode()); fh.write(b"end_header\n")
+        fh.write(data.tobytes())
+    rec = np.zeros(len(m), dtype=[("p", "<f4", 3), ("s", "<f4", 3), ("c", "u1", 4), ("r", "u1", 4)])
+    rec["p"] = m; rec["s"] = np.exp(s)
+    rgb = np.clip(0.5 + 0.28209479177387814 * f0, 0, 1)
+    rec["c"] = (np.concatenate([rgb, 1 / (1 + np.exp(-o[:, None]))], 1) * 255).astype(np.uint8)
+    rec["r"] = np.clip(q * 128 + 128, 0, 255).astype(np.uint8)
+    rec.tofile(splat_path)
+    return len(m)
+
+
 def run_vggt_batches(frame_paths, C_ar, n_batch):
     """分批跑 VGGT（交錯分組），每批各自用 ARKit 軌跡對齊到同一個公尺座標系後合併。"""
     n = len(frame_paths)
@@ -887,10 +1055,14 @@ def icp_refine_batches(ext, Ks, depth, conf, mask, batch_of, B):
     """以第 1 批為基準，用 ICP 微調其他批的位置（ARKit 對齊後的殘餘誤差）"""
     if B < 2:
         return ext
+    P_ref = batch_points(np.nonzero(batch_of == 0)[0], ext, Ks, depth, conf, mask)
+    if len(P_ref) < 500:
+        return ext
+    sz = float((np.percentile(P_ref, 98, 0) - np.percentile(P_ref, 2, 0)).max())   # 物體大小（任何單位都適用）
     def cloud(b):
         P = batch_points(np.nonzero(batch_of == b)[0], ext, Ks, depth, conf, mask)
-        pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P)).voxel_down_sample(0.002)
-        pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.01, max_nn=30))
+        pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P)).voxel_down_sample(0.02 * sz)
+        pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.1 * sz, max_nn=30))
         return pc
     ref = cloud(0)
     if len(ref.points) < 500:
@@ -900,13 +1072,13 @@ def icp_refine_batches(ext, Ks, depth, conf, mask, batch_of, B):
         if len(src.points) < 500:
             continue
         reg = o3d.pipelines.registration.registration_icp(
-            src, ref, 0.006, np.eye(4), o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+            src, ref, 0.06 * sz, np.eye(4), o3d.pipelines.registration.TransformationEstimationPointToPlane(),
             o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=60))
         T = reg.transformation
         ang = np.degrees(np.arccos(np.clip((np.trace(T[:3, :3]) - 1) / 2, -1, 1)))
         mv = np.linalg.norm(T[:3, 3])
-        log(f"ICP 第 {b+1} 批：吻合度 {reg.fitness:.2f}，修正 {mv*100:.2f} cm / {ang:.2f}°")
-        if reg.fitness < 0.3 or mv > 0.02 or ang > 4:
+        log(f"ICP 第 {b+1} 批：吻合度 {reg.fitness:.2f}，修正 {mv / sz:.1%}（相對物體大小）/ {ang:.2f}°")
+        if reg.fitness < 0.3 or mv > 0.2 * sz or ang > 4:
             WARN.append(f"第 {b+1} 批的 ICP 對齊不可靠，沿用 ARKit 對齊")
             continue
         Rt, tt = T[:3, :3], T[:3, 3]
@@ -1032,7 +1204,7 @@ def main():
     TT = meta.get("mode") in ("turntable", "video")      # 物體旋轉模式，或從「照片」匯入的影片（都沒有可用的手機軌跡）
     VIDEO = meta.get("mode") == "video"
     span = np.ptp(C_ar_all, axis=0).max()
-    if not TT and span < 0.15:
+    if not TT and USE_ARKIT and span < 0.15:
         raise RuntimeError(f"手機移動範圍太小（{span*100:.0f} cm），請繞著物體走一圈；如果是旋轉物體的拍法，請在 App 選「物體旋轉」模式")
 
     # ---- 1. 挑影格 ----
@@ -1044,12 +1216,12 @@ def main():
     N = min(N, len(paths))
     sc = np.array([sharpness(p) for p in paths])
     pick = [int(b[np.argmax(sc[b])]) for b in np.array_split(np.arange(len(paths)), N) if len(b)]
-    if TT:
-        marks = meta.get("scale_marks") or []
-        objp = meta.get("object_point")
-        if not marks:
-            raise RuntimeError("物體旋轉模式需要先在 App 裡標記比例尺兩端")
-        need = {m["frame"] for m in marks} | ({objp["frame"]} if objp else set())
+    marks = meta.get("scale_marks") or []
+    objp = meta.get("object_point")
+    if (TT or not USE_ARKIT) and not marks:
+        WARN.append("沒有比例尺，也沒有可用的手機位置資料：模型沒有真實尺寸（相對比例）")
+    need = {m["frame"] for m in marks} | ({objp["frame"]} if objp else set())
+    if need:
         pick = sorted(set(pick) | {i for i, f in enumerate(frames) if f["file"] in need})
     SEL = f"{TMP}/sel"
     shutil.rmtree(SEL, ignore_errors=True); os.makedirs(SEL)
@@ -1080,8 +1252,8 @@ def main():
                 ruler_prompts[k] = [tuple(p1 * 0.95 + p2 * 0.05), tuple(p1 * 0.05 + p2 * 0.95)]   # 只用兩端附近（中段可能被物體擋住）
                 marks_sel.append((k, p1, p2))
         prompts = {k: v[0] for k, v in obj_prompts.items()}
-        mk = run_sam_objects(SEL, len(frame_paths), W0, H0, {1: obj_prompts, 2: ruler_prompts})
-        MASKS, RMASK = mk[1], mk[2]
+        mk = run_sam_objects(SEL, len(frame_paths), W0, H0, {1: obj_prompts, 2: ruler_prompts} if ruler_prompts else {1: obj_prompts})
+        MASKS = mk[1]; RMASK = mk.get(2, np.zeros_like(MASKS))
         MSEL = f"{TMP}/msel"
         shutil.rmtree(MSEL, ignore_errors=True); os.makedirs(MSEL)
         k15 = np.ones((15, 15), np.uint8)
@@ -1095,13 +1267,16 @@ def main():
             crop_src.append(q)
         log(f"轉盤模式：物體與比例尺遮罩完成（物體提示：{target_method}）")
         extrinsic, intrinsic, depth, conf, imgs, batch_of, NB = run_vggt_batches_anchor(crop_src, N_batch)
-        m_per_unit, ruler_pts, Ls = ruler_scale(marks_sel, extrinsic, intrinsic, depth, RMASK, sx, sy, padL, padT,
-                                                float(meta.get("scale_length_cm", 15.0)))
+        if marks_sel:
+            m_per_unit, ruler_pts, Ls = ruler_scale(marks_sel, extrinsic, intrinsic, depth, RMASK, sx, sy, padL, padT,
+                                                    float(meta.get("scale_length_cm", 15.0)))
+        else:                                             # 沒有比例尺：先用 1，最後再換成相對比例
+            m_per_unit, ruler_pts, Ls = 1.0, np.zeros((0, 3)), []
         if len(Ls) > 1 and (max(Ls) - min(Ls)) / np.median(Ls) > 0.06:
             WARN.append(f"各影格量到的比例尺長度差異 {(max(Ls)-min(Ls))/np.median(Ls):.0%}，尺寸可能不準")
         extrinsic[:, :, 3] *= m_per_unit; depth *= m_per_unit     # 換成公尺
         ruler_pts = ruler_pts * m_per_unit
-        if VIDEO or np.allclose(T_ar[pick][:, :3, :3], np.eye(3)):
+        if VIDEO or not USE_ARKIT or np.allclose(T_ar[pick][:, :3, :3], np.eye(3)):
             up_tt, how = up_from_cameras(extrinsic)
             log(f"比例尺：{len(Ls)} 張影格；上方方向依據：{how}")
             if how == "畫面方向":
@@ -1116,24 +1291,30 @@ def main():
         log(f"物體定位（{target_method}）：提示影格 {sorted(prompts)}")
     else:
         # ---- 2. VGGT 第一次 + SAM 2 ----
-        extrinsic, intrinsic, depth, conf, imgs, batch_of, NB = run_vggt_batches(frame_paths, C_ar, N_batch)
-        log(f"VGGT 第一次完成（{NB} 批，共 {len(frame_paths)} 張）")
-        # 用 ARKit 軌跡檢查 VGGT 的相機位置：差太多的影格不拿來建模
-        Ccam, fwd, Rcam = cam_centers_dirs(extrinsic)
-        s1, R1, t1 = umeyama(Ccam, C_ar)
-        res = np.linalg.norm((s1 * Ccam @ R1.T + t1) - C_ar, axis=1)
-        keep_fit = res <= np.percentile(res, 80)
-        s1, R1, t1 = umeyama(Ccam[keep_fit], C_ar[keep_fit])
-        res = np.linalg.norm((s1 * Ccam @ R1.T + t1) - C_ar, axis=1)
-        rms_cm = float(np.sqrt(np.mean(res[keep_fit] ** 2)) * 100)
-        pose_thr = max(0.02, 3.0 * np.median(res))
-        frame_ok = res <= pose_thr
-        bad_pose = [int(i) for i in np.nonzero(~frame_ok)[0]]
-        log(f"ARKit 對齊：殘差 {rms_cm:.2f} cm；相機位置不一致而略過的影格 {bad_pose}")
-        if rms_cm > 3:
-            WARN.append(f"相機軌跡對齊誤差偏大（{rms_cm:.1f} cm），尺寸可能不準")
-        if len(bad_pose) > 0.3 * len(frame_ok):
-            WARN.append(f"有 {len(bad_pose)} 張影格的相機位置不可靠，建議放慢速度、保持距離重拍")
+        if USE_ARKIT:
+            extrinsic, intrinsic, depth, conf, imgs, batch_of, NB = run_vggt_batches(frame_paths, C_ar, N_batch)
+            log(f"VGGT 第一次完成（{NB} 批，共 {len(frame_paths)} 張）")
+            # 用 ARKit 軌跡檢查 VGGT 的相機位置：差太多的影格不拿來建模
+            Ccam, fwd, Rcam = cam_centers_dirs(extrinsic)
+            s1, R1, t1 = umeyama(Ccam, C_ar)
+            res = np.linalg.norm((s1 * Ccam @ R1.T + t1) - C_ar, axis=1)
+            keep_fit = res <= np.percentile(res, 80)
+            s1, R1, t1 = umeyama(Ccam[keep_fit], C_ar[keep_fit])
+            res = np.linalg.norm((s1 * Ccam @ R1.T + t1) - C_ar, axis=1)
+            rms_cm = float(np.sqrt(np.mean(res[keep_fit] ** 2)) * 100)
+            pose_thr = max(0.02, 3.0 * np.median(res))
+            frame_ok = res <= pose_thr
+            bad_pose = [int(i) for i in np.nonzero(~frame_ok)[0]]
+            log(f"ARKit 對齊：殘差 {rms_cm:.2f} cm；相機位置不一致而略過的影格 {bad_pose}")
+            if rms_cm > 3:
+                WARN.append(f"相機軌跡對齊誤差偏大（{rms_cm:.1f} cm），尺寸可能不準")
+            if len(bad_pose) > 0.3 * len(frame_ok):
+                WARN.append(f"有 {len(bad_pose)} 張影格的相機位置不可靠，建議放慢速度、保持距離重拍")
+        else:
+            extrinsic, intrinsic, depth, conf, imgs, batch_of, NB = run_vggt_batches_anchor(frame_paths, N_batch)
+            log(f"未使用手機動作追蹤（ARKit）：相機位置只由畫面推算（{NB} 批，共 {len(frame_paths)} 張）")
+            Ccam, fwd, Rcam = cam_centers_dirs(extrinsic)
+            frame_ok = np.ones(len(frame_paths), bool); bad_pose = []; rms_cm = 0.0
         prompts = find_prompts(extrinsic, intrinsic, depth, W0, H0, padL, padT, sx, sy)
         target_method = "3D 自動定位"
         if not prompts:
@@ -1147,6 +1328,12 @@ def main():
     bad = [int(i) for i in np.nonzero((area < 0.2 * med) | (area > 3.0 * med))[0]]
     for i in bad:                                         # 遮罩異常的影格不拿來建物體
         MASKS[i] = False
+    if not TT and not USE_ARKIT:                          # 沒有 ARKit：用畫面之間的一致性找出相機位置算錯的影格
+        fs = frame_support(extrinsic, intrinsic, depth, MASKS, (padL, padT, nw, nh))
+        med_fs = float(np.nanmedian(fs))
+        bad_pose = [int(i) for i in np.nonzero(fs < max(0.3, med_fs - 0.25))[0]]
+        frame_ok = np.ones(len(frame_paths), bool); frame_ok[bad_pose] = False
+        log(f"畫面一致性檢查（不用 ARKit）：中位數 {med_fs:.0%}；相機位置不一致而略過的影格 {bad_pose}")
     for i in bad_pose:                                    # 相機位置不可靠的影格也不拿來建物體
         MASKS[i] = False
     log(f"SAM 2 完成，遮罩面積中位數 {med:.1%}，異常影格 {bad}")
@@ -1297,9 +1484,8 @@ def main():
     if TT:
         # ---- 5T. 轉盤模式：世界座標已是公尺；上方＝重力反方向；桌面高度＝比例尺所在高度 ----
         center = np.median(P_obj0, 0)
-        h_ruler = float(np.median(ruler_pts @ up_tt))         # 比例尺上表面（筆之類較厚時會偏高）
         h_obj = float(np.percentile(P_obj0 @ up_tt, 0.5))     # 物體最低處
-        h0 = min(h_ruler, h_obj)
+        h0 = min(float(np.median(ruler_pts @ up_tt)), h_obj) if len(ruler_pts) else h_obj   # 比例尺上表面（筆之類較厚時會偏高）
         Ra2, o2 = align_transform(up_tt, -h0, center, Ccam[0])
         A = Ra2
         to_al = lambda P: 100.0 * (P - o2) @ Ra2.T
@@ -1309,28 +1495,84 @@ def main():
         has_table = True
         del Pb_tmp
     else:
-        # ---- 5. 用 ARKit 相機位置換算真實尺寸（公尺）與重力方向（相似轉換已在前面算好）----
-        M = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], float)     # ARKit y-up → z-up
-        to_cm1 = lambda P: 100.0 * ((s1 * P @ R1.T + t1) @ M.T)
-        Pb1, Pg1, C1 = to_cm1(P_obj0), to_cm1(P_bg0), to_cm1(Ccam)
+        if USE_ARKIT:
+            # ---- 5. 用 ARKit 相機位置換算真實尺寸（公尺）與重力方向（相似轉換已在前面算好）----
+            M = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], float)     # ARKit y-up → z-up
+            to_cm1 = lambda P: 100.0 * ((s1 * P @ R1.T + t1) @ M.T)
+            Pb1, Pg1, C1 = to_cm1(P_obj0), to_cm1(P_bg0), to_cm1(Ccam)
 
-        center = np.median(Pb1, 0)
-        size0 = np.percentile(Pb1, 98, 0) - np.percentile(Pb1, 2, 0)
-        U = float(np.clip(size0.max() / 12.0, 0.5, 6.0))           # 長度單位：小熊（12 cm）= 1
-        Dcam = np.median(np.linalg.norm(C1 - center, axis=1))
-        has_table = True
-        try:
-            n_pl, d_pl, frac = fit_table_plane(Pg1, center, C1, radius=0.6 * Dcam,
-                                               dist_thr=max(0.3, 0.006 * Dcam), up_prior=np.array([0, 0, 1.0]))
-        except RuntimeError:
-            has_table = False
-            WARN.append("找不到桌面，以物體最低點為底")
-            n_pl = np.array([0, 0, 1.0]); d_pl = -np.percentile(Pb1[:, 2], 1)
-        Ra2, o2 = align_transform(n_pl, d_pl, center, C1[0])
-        k_al = 100.0 * s1
-        A = Ra2 @ M @ R1
-        b_al = Ra2 @ (100.0 * M @ t1 - o2)
-        to_al = lambda P: k_al * P @ A.T + b_al
+            center = np.median(Pb1, 0)
+            size0 = np.percentile(Pb1, 98, 0) - np.percentile(Pb1, 2, 0)
+            U = float(np.clip(size0.max() / 12.0, 0.5, 6.0))           # 長度單位：小熊（12 cm）= 1
+            Dcam = np.median(np.linalg.norm(C1 - center, axis=1))
+            has_table = True
+            try:
+                n_pl, d_pl, frac = fit_table_plane(Pg1, center, C1, radius=0.6 * Dcam,
+                                                   dist_thr=max(0.3, 0.006 * Dcam), up_prior=np.array([0, 0, 1.0]))
+            except RuntimeError:
+                has_table = False
+                WARN.append("找不到桌面，以物體最低點為底")
+                n_pl = np.array([0, 0, 1.0]); d_pl = -np.percentile(Pb1[:, 2], 1)
+            Ra2, o2 = align_transform(n_pl, d_pl, center, C1[0])
+            k_al = 100.0 * s1
+            A = Ra2 @ M @ R1
+            b_al = Ra2 @ (100.0 * M @ t1 - o2)
+            to_al = lambda P: k_al * P @ A.T + b_al
+        else:
+            # ---- 5. 未使用 ARKit：桌面平面定上下（畫面「上方」當參考），尺寸之後由比例尺換算 ----
+            center = np.median(P_obj0, 0)
+            Dcam = np.median(np.linalg.norm(Ccam - center, axis=1))
+            up_prior = -Rcam[:, 1, :].mean(0); up_prior /= np.linalg.norm(up_prior)
+            has_table = True
+            try:
+                n_pl, d_pl, frac = fit_table_plane(P_bg0, center, Ccam, radius=0.6 * Dcam, dist_thr=0.006 * Dcam, up_prior=up_prior)
+            except RuntimeError:
+                has_table = False
+                WARN.append("找不到桌面，以物體最低點為底")
+                n_pl = up_prior; d_pl = -np.percentile(P_obj0 @ n_pl, 1)
+            Ra2, o2 = align_transform(n_pl, d_pl, center, Ccam[0])
+            A = Ra2
+            to_al = lambda P: (P - o2) @ Ra2.T                       # 暫時的單位（VGGT），比例尺換算後變公分
+            size0 = np.percentile(to_al(P_obj0), 98, 0) - np.percentile(to_al(P_obj0), 2, 0)
+            U = float(size0.max() / 12.0)
+    # ---- 比例尺（手機繞物體模式，選用）：三角測量比例尺兩端，換算或驗證 ARKit 的尺寸 ----
+    scale_info = dict(scale_source="arkit" if not TT else "ruler", use_arkit=USE_ARKIT)
+    marks_o = meta.get("scale_marks") or []
+    if not TT and marks_o and (SCALE_SOURCE != "arkit" or not USE_ARKIT):
+        sel_of_o = {frames[i]["file"]: k for k, i in enumerate(pick)}
+        ms_ = [(sel_of_o[m["frame"]], np.array(m["p1"], float), np.array(m["p2"], float)) for m in marks_o if m["frame"] in sel_of_o]
+        if len(ms_) >= 2:
+            A_w, B_w, rel_res, ang_ = ruler_triangulate(ms_, extrinsic, intrinsic, sx, sy, padL, padT)
+            L_al = float(np.linalg.norm(to_al(A_w[None])[0] - to_al(B_w[None])[0]))
+            L_true = float(meta.get("scale_length_cm") or 15.0)
+            f_r = L_true / L_al
+            if USE_ARKIT:
+                log(f"比例尺三角測量：{len(ms_)} 張，夾角 {ang_:.0f}°，交會誤差 {rel_res:.1%}；ARKit 量到 {L_al:.2f} cm（實際 {L_true:.2f}），差 {f_r - 1:+.1%}")
+                scale_info.update(ruler_measured_by_arkit_cm=round(L_al, 2), ruler_vs_arkit=round(f_r - 1, 4))
+            else:
+                log(f"比例尺三角測量：{len(ms_)} 張，夾角 {ang_:.0f}°，交會誤差 {rel_res:.1%}；以比例尺 {L_true:.2f} cm 換算尺寸")
+            if ang_ >= 8 and rel_res < 0.05:
+                to_al0 = to_al
+                to_al = lambda P, f=f_r, g=to_al0: f * g(P)
+                scale_info["scale_source"] = "ruler"
+                U = U * f_r
+            else:
+                WARN.append("比例尺標記的角度差太小或點不準，改用 ARKit 尺寸")
+        else:
+            WARN.append("比例尺至少要在 2 張畫面標記，改用 ARKit 尺寸")
+        if not USE_ARKIT and scale_info["scale_source"] != "ruler":
+            WARN.append("比例尺無法使用（標記角度差太小或點不準），模型沒有真實尺寸（相對比例）")
+        if SCALE_SOURCE == "ruler" and scale_info["scale_source"] != "ruler":
+            WARN.append("指定使用比例尺，但比例尺無法使用，改用 ARKit 尺寸")
+    unitless = (TT and not marks) or (not TT and not USE_ARKIT and scale_info.get("scale_source") != "ruler")
+    if unitless:                                          # 沒有真實尺寸：把物體最大邊設成 10（相對單位）
+        ext0 = np.percentile(to_al(P_obj0), 98, 0) - np.percentile(to_al(P_obj0), 2, 0)
+        f_u = 10.0 / max(float(ext0.max()), 1e-9)
+        to_al_u = to_al
+        to_al = lambda P, f=f_u, g=to_al_u: f * g(P)
+        U = 10.0 / 12.0
+        scale_info["scale_source"] = "none"
+        log("沒有真實尺寸：以相對比例建模（物體最大邊 = 10）")
     Pc_b, Pc_g, Cc = to_al(P_obj0), to_al(P_bg0), to_al(Ccam)
     Pc_src = to_al(src_P)
     del P_obj0, P_bg0
@@ -1385,11 +1627,50 @@ def main():
 
     # ---- 8. 匯出 ----
     export_all(mesh, tex_pack)
+    # ---- 9. 3DGS 擬真模型（選用）----
+    gs_info = {}
+    if USE_GS:
+        try:
+            try:
+                import gsplat  # noqa
+            except ImportError:
+                sh("pip -q install ninja gsplat")
+            import gsplat
+            log("gsplat", gsplat.__version__, "（第一次執行會編譯 CUDA 程式，約 5~10 分鐘）")
+            ok_ids = [i for i in range(len(frame_paths)) if MASKS[i].any()]
+            b0 = to_al(np.zeros((1, 3)))[0]
+            Alin = np.stack([to_al(np.eye(3)[k:k + 1])[0] - b0 for k in range(3)], 1)   # 轉正座標 = Alin·X + b0
+            c_ = float(np.cbrt(np.linalg.det(Alin))); Rot = Alin / c_
+            ds = min(1.0, GS_RES / max(W0, H0))
+            VMs, KSs = [], []
+            for i in ok_ids:
+                Rv = extrinsic[i][:, :3].astype(np.float64); tv = extrinsic[i][:, 3].astype(np.float64)
+                V4 = np.eye(4); V4[:3, :3] = Rv @ Rot.T; V4[:3, 3] = c_ * tv - Rv @ Rot.T @ b0
+                Ki = intrinsic[i].astype(np.float64)
+                cxo = (Ki[0, 2] - padL + 0.5) / sx - 0.5; cyo = (Ki[1, 2] - padT + 0.5) / sy - 0.5
+                KSs.append(np.array([[Ki[0, 0] / sx * ds, 0, (cxo + 0.5) * ds - 0.5], [0, Ki[1, 1] / sy * ds, (cyo + 0.5) * ds - 0.5], [0, 0, 1]]))
+                VMs.append(V4)
+            # 初始點：網格上物體部分的表面取樣（含顏色）
+            obj_m = o3d.geometry.TriangleMesh(mesh)
+            Vm = np.asarray(obj_m.vertices); Fm = np.asarray(obj_m.triangles)
+            obj_m.remove_triangles_by_mask((Vm[Fm][:, :, 2] <= 1.5 * vox).all(1)); obj_m.remove_unreferenced_vertices()
+            spc = obj_m.sample_points_uniformly(200_000)
+            P0, C0 = np.asarray(spc.points), np.clip(np.asarray(spc.colors), 0, 1)
+            log(f"3DGS 訓練：{len(ok_ids)} 張影像（{int(W0 * ds)}×{int(H0 * ds)}），{GS_ITERS} 步，初始 {len(P0):,} 點")
+            g = train_3dgs([frame_paths[i] for i in ok_ids], [MASKS[i] for i in ok_ids], VMs, KSs, W0, H0, ds, P0, C0, GS_ITERS)
+            n_out = export_gaussians(g, GS_MAX, f"{WORK}/gaussians.ply", f"{WORK}/model.splat")
+            gs_info = dict(gs=True, gs_count=int(n_out), gs_mb=round(os.path.getsize(f"{WORK}/model.splat") / 1e6, 1))
+            log(f"3DGS 完成：{n_out:,} 個元素，model.splat {gs_info['gs_mb']} MB")
+        except Exception as e:
+            traceback.print_exc()
+            WARN.append(f"3DGS 失敗（網格模型仍可使用）：{str(e)[:120]}")
+            gs_info = dict(gs=False)
+
     info.update(tsdf=tsdf_used, textured=tex_pack is not None,
                 params_used=PARAMS_USED,
                 params_summary=("、".join(f"{k}={v}" for k, v in PARAMS_USED.items()) or "全部預設"))
     ext = bp.max(0) - bp.min(0)
-    info.update(mode=meta.get("mode") or "orbit")
+    info.update(mode=meta.get("mode") or "orbit", **scale_info, **gs_info)
     info.update(target_method=target_method, prompt_frames=len(prompts), bad_pose_frames=len(bad_pose),
                 batches=int(NB), smooth_level=SMOOTH_LEVEL,
                 consistency_keep=round(float(keepc.mean()), 3),

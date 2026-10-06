@@ -26,7 +26,7 @@ struct MarkScaleView: View {
                 .padding(.horizontal)
 
                 Text(tapMode == 0
-                     ? "在比例尺（\(String(format: "%.0f", scaleLengthCM)) cm）的兩個端點各點一下。建議在 2 張不同角度的畫面上都標記。"
+                     ? "在比例尺（\(String(format: "%.1f", scaleLengthCM)) cm）的兩個端點各點一下；左右滑動換畫面，建議在 2~4 張不同角度的畫面標記。"
                      : "在物體上點一下，幫助程式找到要建模的物體。")
                     .font(.footnote).foregroundColor(.secondary)
                     .padding(.horizontal)
@@ -156,7 +156,7 @@ struct MarkScaleView: View {
 
     private func save() {
         guard var m = meta else { return }
-        if m.mode != "video" { m.mode = "turntable" }
+        if m.mode == nil { m.mode = "orbit" }
         m.scale_length_cm = scaleLengthCM
         m.scale_marks = marks.compactMap { fi, pts in
             pts.count == 2 ? ScaleMark(frame: m.frames[fi].file, p1: [pts[0].x, pts[0].y], p2: [pts[1].x, pts[1].y]) : nil
