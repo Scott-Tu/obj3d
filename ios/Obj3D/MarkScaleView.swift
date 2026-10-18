@@ -18,6 +18,7 @@ struct MarkScaleView: View {
     // 拖曳中的狀態
     @State private var dragLoc: CGPoint?
     @State private var editIndex: Int?                  // 正在拖曳的既有點（nil = 新增）
+    @State private var grabOffset: CGSize = .zero       // 抓既有點時，點與手指的距離（避免點跳到手指下）
 
     private let loupeSize: CGFloat = 140
     private let zoom: CGFloat = 3.5
@@ -139,20 +140,28 @@ struct MarkScaleView: View {
                 .highPriorityGesture(DragGesture(minimumDistance: 0)
                     .onChanged { v in
                         if dragLoc == nil {                     // 剛按下：靠近既有的點就是「移動那個點」
-                            editIndex = nil
+                            editIndex = nil; grabOffset = .zero
+                            var best: CGFloat = 30
                             if tapMode == 0, let pts = marks[fi] {
-                                for (k, p) in pts.enumerated() where dist(toView(p, img.size, rect), v.startLocation) < 30 {
-                                    editIndex = k
+                                for (k, p) in pts.enumerated() {
+                                    let pv = toView(p, img.size, rect), d = dist(pv, v.startLocation)
+                                    if d < best {
+                                        best = d; editIndex = k
+                                        grabOffset = CGSize(width: pv.x - v.startLocation.x, height: pv.y - v.startLocation.y)
+                                    }
                                 }
-                            } else if tapMode == 1, let o = objectTap, o.0 == fi,
-                                      dist(toView(o.1, img.size, rect), v.startLocation) < 30 {
-                                editIndex = 0
+                            } else if tapMode == 1, let o = objectTap, o.0 == fi {
+                                let pv = toView(o.1, img.size, rect)
+                                if dist(pv, v.startLocation) < 30 {
+                                    editIndex = 0
+                                    grabOffset = CGSize(width: pv.x - v.startLocation.x, height: pv.y - v.startLocation.y)
+                                }
                             }
                         }
-                        dragLoc = clamp(v.location, rect)
+                        dragLoc = clamp(CGPoint(x: v.location.x + grabOffset.width, y: v.location.y + grabOffset.height), rect)
                     }
                     .onEnded { v in
-                        let p = toImage(clamp(v.location, rect), img.size, rect)
+                        let p = toImage(dragLoc ?? clamp(v.location, rect), img.size, rect)
                         if tapMode == 1 {
                             objectTap = (fi, p)
                         } else {
@@ -165,7 +174,7 @@ struct MarkScaleView: View {
                             }
                             marks[fi] = pts
                         }
-                        dragLoc = nil; editIndex = nil
+                        dragLoc = nil; editIndex = nil; grabOffset = .zero
                     })
             }
         } else {
@@ -179,19 +188,23 @@ struct MarkScaleView: View {
         let above = loc.y - L * 0.95 - L / 2 > 0
         let cx = min(max(loc.x, L / 2 + 4), container.width - L / 2 - 4)
         let cy = above ? loc.y - L * 0.95 : loc.y + L * 0.95
-        return ZStack(alignment: .topLeading) {
-            Image(uiImage: img).resizable()
-                .frame(width: rect.width * zoom, height: rect.height * zoom)
-                .offset(x: L / 2 - (loc.x - rect.minX) * zoom, y: L / 2 - (loc.y - rect.minY) * zoom)
-            Path { p in                                    // 十字準心（中間留空，不擋住目標）
-                p.move(to: CGPoint(x: L / 2, y: 8)); p.addLine(to: CGPoint(x: L / 2, y: L / 2 - 7))
-                p.move(to: CGPoint(x: L / 2, y: L / 2 + 7)); p.addLine(to: CGPoint(x: L / 2, y: L - 8))
-                p.move(to: CGPoint(x: 8, y: L / 2)); p.addLine(to: CGPoint(x: L / 2 - 7, y: L / 2))
-                p.move(to: CGPoint(x: L / 2 + 7, y: L / 2)); p.addLine(to: CGPoint(x: L - 8, y: L / 2))
-            }
-            .stroke(Color.red, lineWidth: 1.5)
-            Circle().stroke(Color.red, lineWidth: 1).frame(width: 6, height: 6)
-                .position(x: L / 2, y: L / 2)
+        // 用 Canvas 依座標直接繪製：放大圖的左上角放在 (L/2 − 手指相對圖的位置 × 倍率)，
+        // 讓手指下的像素正好落在圓心。（舊版用 ZStack+offset，大圖被外框置中，畫面整個偏掉）
+        let ox = L / 2 - (loc.x - rect.minX) * zoom
+        let oy = L / 2 - (loc.y - rect.minY) * zoom
+        return Canvas { ctx, _ in
+            ctx.fill(Path(CGRect(x: 0, y: 0, width: L, height: L)), with: .color(.black))
+            ctx.draw(Image(uiImage: img).resizable(),
+                     in: CGRect(x: ox, y: oy, width: rect.width * zoom, height: rect.height * zoom))
+            var cross = Path()                             // 十字準心（中間留空，不擋住目標）
+            cross.move(to: CGPoint(x: L / 2, y: 8)); cross.addLine(to: CGPoint(x: L / 2, y: L / 2 - 7))
+            cross.move(to: CGPoint(x: L / 2, y: L / 2 + 7)); cross.addLine(to: CGPoint(x: L / 2, y: L - 8))
+            cross.move(to: CGPoint(x: 8, y: L / 2)); cross.addLine(to: CGPoint(x: L / 2 - 7, y: L / 2))
+            cross.move(to: CGPoint(x: L / 2 + 7, y: L / 2)); cross.addLine(to: CGPoint(x: L - 8, y: L / 2))
+            ctx.stroke(cross, with: .color(.white), lineWidth: 3)   // 白底襯線，深色背景也看得到
+            ctx.stroke(cross, with: .color(.red), lineWidth: 1.5)
+            ctx.stroke(Path(ellipseIn: CGRect(x: L / 2 - 3, y: L / 2 - 3, width: 6, height: 6)),
+                       with: .color(.red), lineWidth: 1)
         }
         .frame(width: L, height: L)
         .clipShape(Circle())
