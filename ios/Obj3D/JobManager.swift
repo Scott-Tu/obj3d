@@ -351,6 +351,10 @@ final class JobManager: ObservableObject {
                     }
                 }
                 // 還是上一次的輸出：繼續等；若確定失敗則停止
+                if s.contains("complete") && elapsed > 600 {
+                    // 送出後 10 分鐘，Kaggle 上仍是舊的運算結果、也沒有排隊或執行中 → 新的運算根本沒啟動
+                    throw KaggleError(message: "Kaggle 沒有啟動新的運算（obj3d-runner 仍是上一次的結果）。請按「生成 3D 模型」重送；若再發生，請到 kaggle.com 查看 obj3d-capture-data 是否有檔案")
+                }
                 if s.contains("error") && elapsed > 180 {
                     throw KaggleError(message: "Kaggle 執行失敗：\(failure ?? "請到 kaggle.com 查看 obj3d-runner 的紀錄")")
                 }

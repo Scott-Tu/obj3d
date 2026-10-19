@@ -190,6 +190,16 @@ struct KaggleClient {
         return token
     }
 
+    /// Kaggle 拒絕要求時，常常還是回 HTTP 200，只在回覆的 "error" 欄位寫原因；這裡把它變成真正的錯誤
+    private func requireOK(_ r: [String: Any], _ what: String) throws {
+        if let e = r["error"] as? String, !e.trimmingCharacters(in: .whitespaces).isEmpty {
+            throw KaggleError(message: "Kaggle 拒絕\(what)：\(e)")
+        }
+        if let st = r["status"] as? String, st.lowercased() == "error" {
+            throw KaggleError(message: "Kaggle 拒絕\(what)（沒有說明原因）")
+        }
+    }
+
     func pushDataset(slug: String, title: String, fileToken: String) async throws {
         var exists = true
         do {
@@ -199,7 +209,7 @@ struct KaggleClient {
             exists = false
         }
         if exists {
-            try await call("datasets.DatasetApiService", "CreateDatasetVersion", [
+            let r = try await call("datasets.DatasetApiService", "CreateDatasetVersion", [
                 "ownerSlug": username,
                 "datasetSlug": slug,
                 "body": [
@@ -208,8 +218,9 @@ struct KaggleClient {
                     "files": [["token": fileToken]],
                 ] as [String: Any],
             ])
+            try requireOK(r, "更新資料集")
         } else {
-            try await call("datasets.DatasetApiService", "CreateDataset", [
+            let r = try await call("datasets.DatasetApiService", "CreateDataset", [
                 "ownerSlug": username,
                 "slug": slug,
                 "title": title,
@@ -217,6 +228,7 @@ struct KaggleClient {
                 "isPrivate": true,
                 "files": [["token": fileToken]],
             ])
+            try requireOK(r, "建立資料集")
         }
     }
 
@@ -253,7 +265,8 @@ struct KaggleClient {
             "categoryIds": [String](),
         ]
         if !machineShape.isEmpty { body["machineShape"] = machineShape }
-        try await call("kernels.KernelsApiService", "SaveKernel", body)
+        let r = try await call("kernels.KernelsApiService", "SaveKernel", body)
+        try requireOK(r, "啟動運算")
     }
 
     func kernelStatus(slug: String) async throws -> (status: String, failure: String?) {
