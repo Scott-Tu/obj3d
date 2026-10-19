@@ -5,7 +5,7 @@
 #        preview.bin（App 預覽用）、result_meta.json
 # =====================================================================
 JOB_ID = "__JOB_ID__"
-RUNNER_VERSION = "2026.10.09-3dgs-clean"   # 每次修改運算程式時更新
+RUNNER_VERSION = "2026.10.19-sam-fp32fix"   # 每次修改運算程式時更新
 SMOOTH_LEVEL = "__SMOOTH__"      # low / medium / high（由 App 設定）
 
 import os, sys, json, time, glob, shutil, subprocess, zipfile, traceback
@@ -692,7 +692,29 @@ def run_sam_objects(sel_dir, n, W0, H0, objs):
     from sam2.sam2_video_predictor import SAM2VideoPredictor
     pred = SAM2VideoPredictor.from_pretrained("facebook/sam2.1-hiera-large")
     bf16 = torch.cuda.get_device_capability()[0] >= 8
+    patched = [False]
+
+    def _keep_float32():
+        """SAM 2 套件會把每張畫面的「記憶特徵」強制存成 bfloat16（sam2_video_predictor.py）。
+        不開 bfloat16 自動轉換時（例如 Kaggle 的 T4），下一張畫面用 float32 權重去算就會出現
+        「mat1 and mat2 must have the same dtype, but got BFloat16 and Float」。這裡把存起來的記憶轉回 float32。"""
+        if patched[0]:
+            return
+        f1, f2 = pred._run_single_frame_inference, pred._run_memory_encoder
+        def single(*a, **k):
+            out, masks_ = f1(*a, **k)
+            if out.get("maskmem_features") is not None:
+                out["maskmem_features"] = out["maskmem_features"].float()
+            return out, masks_
+        def memenc(*a, **k):
+            mf, pe = f2(*a, **k)
+            return (mf.float() if mf is not None else mf), pe
+        pred._run_single_frame_inference, pred._run_memory_encoder = single, memenc
+        patched[0] = True
+
     def _track(use_bf16):
+        if not use_bf16:
+            _keep_float32()
         masks = {int(o): np.zeros((n, H0, W0), bool) for o in objs}
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
             st = pred.init_state(sel_dir, offload_video_to_cpu=True)
@@ -705,12 +727,13 @@ def run_sam_objects(sel_dir, n, W0, H0, objs):
                     for k, oid in enumerate(obj_ids):
                         masks[int(oid)][fidx] |= (lg[k, 0] > 0).cpu().numpy()
         return masks
+    log("SAM 2 精度：", "bfloat16" if bf16 else "float32（此 GPU 不支援 bfloat16）")
     try:
         masks = _track(bf16)
     except RuntimeError as e:
-        if not bf16 or "dtype" not in str(e):
+        if "dtype" not in str(e):
             raise
-        log("SAM 2 bfloat16 失敗，改用 float32 重跑：", str(e)[:120])
+        log("SAM 2 資料型別錯誤，改用 float32 重跑：", str(e)[:120])
         torch.cuda.empty_cache()
         masks = _track(False)
     del pred
