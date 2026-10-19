@@ -169,6 +169,18 @@ final class JobManager: ObservableObject {
         task = Task { await runGenerate() }
     }
 
+    /// 正在查詢 Kaggle 狀態時，最後一次有進展的時間（App 在背景被 iOS 暫停時，網路查詢可能卡住不回來）
+    private var pollHeartbeat: Date?
+    private var runToken = 0                              // 每次開始生成或查詢就加 1；舊的工作結束時不去改畫面
+
+    func appBecameActive() {
+        guard let last = pollHeartbeat, phase == .working, jobId != nil else { return }
+        if Date().timeIntervalSince(last) > 90 {
+            status = "重新連線查詢 Kaggle…"
+            resume()
+        }
+    }
+
     func resume() {
         guard let id = jobId else { return }
         task?.cancel()
@@ -206,6 +218,7 @@ final class JobManager: ObservableObject {
     }
 
     private func runGenerate() async {
+        runToken &+= 1; let myToken = runToken
         guard let dir = captureURL else { return }
         guard let client = KaggleClient.fromSettings() else {
             fail("請先到右上角「設定」填入 Kaggle 使用者名稱與 API 金鑰")
@@ -244,13 +257,14 @@ final class JobManager: ObservableObject {
             try await startKernel(client: client, jobId: jobId)
             try await poll(client: client, jobId: jobId)
         } catch is CancellationError {
-            paused()
+            if runToken == myToken { paused() }
         } catch {
-            fail(error.localizedDescription)
+            if runToken == myToken { fail(error.localizedDescription) }   // 已被新的查詢取代就不更新畫面
         }
     }
 
     private func runResume(jobId: String) async {
+        runToken &+= 1; let myToken = runToken
         guard let client = KaggleClient.fromSettings() else {
             fail("請先到「設定」填入 Kaggle 帳號")
             return
@@ -262,9 +276,9 @@ final class JobManager: ObservableObject {
         do {
             try await poll(client: client, jobId: jobId)
         } catch is CancellationError {
-            paused()
+            if runToken == myToken { paused() }
         } catch {
-            fail(error.localizedDescription)
+            if runToken == myToken { fail(error.localizedDescription) }   // 已被新的查詢取代就不更新畫面
         }
     }
 
@@ -290,8 +304,10 @@ final class JobManager: ObservableObject {
     private func poll(client: KaggleClient, jobId: String) async throws {
         let start = Date()
         var restarts = 0
+        defer { pollHeartbeat = nil }
         while true {
             try Task.checkCancellation()
+            pollHeartbeat = Date()
             let elapsed = Date().timeIntervalSince(start)
             if elapsed > 4 * 3600 { throw KaggleError(message: "等待超過 4 小時，請到 Kaggle 網站查看 obj3d-runner") }
             var statusPair: (String, String?)

@@ -5,7 +5,7 @@
 #        preview.bin（App 預覽用）、result_meta.json
 # =====================================================================
 JOB_ID = "__JOB_ID__"
-RUNNER_VERSION = "2026.10.19-sam-fp32fix"   # 每次修改運算程式時更新
+RUNNER_VERSION = "2026.10.19-video-orbit"   # 每次修改運算程式時更新
 SMOOTH_LEVEL = "__SMOOTH__"      # low / medium / high（由 App 設定）
 
 import os, sys, json, time, glob, shutil, subprocess, zipfile, traceback
@@ -1245,6 +1245,7 @@ def consistency_filter(P, F, extrinsic, intrinsic, depth, frame_ok, box, tol=0.0
 
 
 def main():
+    global USE_ARKIT
     cap_dir, meta = find_capture()
     if cap_dir is None:
         write_meta(status="error", error="stale_capture",
@@ -1256,8 +1257,14 @@ def main():
     paths = [os.path.join(cap_dir, f["file"]) for f in frames]
     T_ar = np.array([np.array(f["transform"], float).reshape(4, 4).T for f in frames])   # column-major
     C_ar_all = T_ar[:, :3, 3]
-    TT = meta.get("mode") in ("turntable", "video")      # 物體旋轉模式，或從「照片」匯入的影片（都沒有可用的手機軌跡）
     VIDEO = meta.get("mode") == "video"
+    # 從「照片」匯入的影片：拍法是手機繞著不動的物體，但沒有手機軌跡（ARKit）。
+    # 走「繞物體、不用 ARKit」流程：保留背景（桌面紋理）讓 VGGT 定位相機。
+    # （舊版當成物體旋轉模式，把背景塗灰後才定位，低紋理物體的相機位置會整個算錯）
+    TT = meta.get("mode") == "turntable"
+    if VIDEO:
+        USE_ARKIT = False
+        log("匯入的影片：沒有手機軌跡，相機位置只由畫面推算")
     span = np.ptp(C_ar_all, axis=0).max()
     if not TT and USE_ARKIT and span < 0.15:
         raise RuntimeError(f"手機移動範圍太小（{span*100:.0f} cm），請繞著物體走一圈；如果是旋轉物體的拍法，請在 App 選「物體旋轉」模式")
@@ -1376,6 +1383,11 @@ def main():
             target_method = "畫面中央（3D 定位失敗）"
             WARN.append("無法用 3D 定位物體，改用畫面中央")
             prompts = {int(i): (W0 / 2, H0 / 2) for i in sorted(set(np.linspace(0, len(frame_paths) - 1, 4).astype(int)))}
+        if objp:                                          # 使用者在標記畫面點過物體：加進提示（最可靠）
+            k_o = next((k for k, i in enumerate(pick) if frames[i]["file"] == objp["frame"]), None)
+            if k_o is not None:
+                prompts[k_o] = tuple(objp["p"])
+                target_method = "使用者標記＋" + target_method
         log(f"物體定位（{target_method}）：提示影格 {sorted(prompts)}")
         MASKS = run_sam(SEL, len(frame_paths), W0, H0, prompts)
     area = MASKS.reshape(len(MASKS), -1).mean(1)
