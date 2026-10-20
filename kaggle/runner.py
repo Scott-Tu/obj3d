@@ -5,7 +5,7 @@
 #        preview.bin（App 預覽用）、result_meta.json
 # =====================================================================
 JOB_ID = "__JOB_ID__"
-RUNNER_VERSION = "2026.10.19-video-orbit"   # 每次修改運算程式時更新
+RUNNER_VERSION = "2026.10.20-gs-mesh"   # 每次修改運算程式時更新
 SMOOTH_LEVEL = "__SMOOTH__"      # low / medium / high（由 App 設定）
 
 import os, sys, json, time, glob, shutil, subprocess, zipfile, traceback
@@ -81,6 +81,7 @@ GS_RES = int(_p("gs_res", 1280))
 GS_MAX = int(_p("gs_max_gaussians", 400_000))
 GS_CLEAN = _flag("gs_clean", True)              # 去毛邊：剔除輪廓外的漂浮點、針狀與太淡的高斯
 GS_MIN_OPACITY = _p("gs_min_opacity", 0.05)
+GS_MESH = _flag("gs_mesh", True)                # 網格形狀改由 3DGS 決定（渲染深度 → TSDF），取代 VGGT 深度
 PARAMS_USED = {k: v for k, v in PARAMS.items()
                if k != "capture_fps" and ((isinstance(v, bool) and not v) or (not isinstance(v, bool) and v not in (0, 0.0, None)))}
 
@@ -1013,27 +1014,109 @@ def train_3dgs(frame_paths, masks, viewmats, Ks, W0, H0, ds, P0, C0, iters, log_
     return out
 
 
-def clean_gaussians(g, viewmats, Ks, masks, W0, H0, ds, min_opacity=0.05, min_out=3):
-    """去毛邊：(1) 中心點在 min_out 張以上畫面落在物體輪廓外 → 漂浮點；(2) 太淡；(3) 又大又細長的針狀"""
+def clean_gaussians(g, viewmats, Ks, masks, W0, H0, ds, min_opacity=0.05, min_out=3, out_frac=0.2,
+                    surf=None, surf_tol=0.0):
+    """去毛邊：(1) 漂浮點：在「看得到它的畫面」中，有 out_frac 以上比例落在物體輪廓外（且至少 min_out 張）；
+    (2) 太淡；(3) 又大又細長的針狀。
+    用比例而非固定張數：細的部位（杯子手把）只要相機位置差幾個像素，就會在少數畫面跑出輪廓，
+    舊版「3 張就刪」會把整段手把刪掉；真正的漂浮點幾乎在每個角度都在輪廓外，仍會被刪。"""
     Wt, Ht = int(round(W0 * ds)), int(round(H0 * ds))
     m = g["means"]
-    outside = np.zeros(len(m), np.int32)
-    k5 = np.ones((5, 5), np.uint8)
+    outside = np.zeros(len(m), np.int32); seen = np.zeros(len(m), np.int32)
+    kd = int(max(5, round(0.012 * max(W0, H0)))) | 1        # 輪廓容許誤差：約畫面寬度的 1.2%
+    kern = np.ones((kd, kd), np.uint8)
     for V, K, mk in zip(viewmats, Ks, masks):
-        md = cv2.resize(cv2.dilate(mk.astype(np.uint8), k5), (Wt, Ht), interpolation=cv2.INTER_NEAREST) > 0
+        md = cv2.resize(cv2.dilate(mk.astype(np.uint8), kern), (Wt, Ht), interpolation=cv2.INTER_NEAREST) > 0
         Xc = m @ V[:3, :3].T + V[:3, 3]
         z = Xc[:, 2]; ok = z > 1e-6; zs = np.where(ok, z, 1)
         u = np.round(K[0, 0] * Xc[:, 0] / zs + K[0, 2]).astype(int); v = np.round(K[1, 1] * Xc[:, 1] / zs + K[1, 2]).astype(int)
         ok &= (u >= 0) & (u < Wt) & (v >= 0) & (v < Ht)
         ii = np.nonzero(ok)[0]
+        seen[ii] += 1
         outside[ii] += ~md[v[ii], u[ii]]
+    floater = (outside >= min_out) & (outside >= out_frac * np.maximum(seen, 1))
     op = 1 / (1 + np.exp(-g["opacities"]))
     s = np.exp(g["scales"]); smax, smin = s.max(1), np.maximum(s.min(1), 1e-9)
     needle = (smax / smin > 25) & (smax > 3 * np.median(smax))
-    keep = (outside < min_out) & (op >= min_opacity) & ~needle
-    log(f"3DGS 去毛邊：輪廓外 {int((outside >= min_out).sum()):,}、太淡 {int((op < min_opacity).sum()):,}、"
-        f"針狀 {int(needle.sum()):,}，保留 {keep.mean():.0%}")
+    faint = op < min_opacity
+    near = np.zeros(len(m), bool)
+    if surf is not None and surf_tol > 0:
+        # 貼在 3DGS 融合表面上的元素是物體的一部分（例如杯子手把常由較透明的元素組成），不當成毛邊刪掉；
+        # 只有「大多數畫面都在輪廓外」的才仍視為漂浮點
+        near = surf.query(m, k=1)[0] < surf_tol
+        floater &= ~(near & (outside < 0.5 * np.maximum(seen, 1)))
+        faint &= ~near
+    keep = ~floater & ~faint & ~needle
+    log(f"3DGS 去毛邊：輪廓外 {int(floater.sum()):,}、太淡 {int(faint.sum()):,}、"
+        f"針狀 {int(needle.sum()):,}（貼近表面而保留 {int(near.sum()):,}），保留 {keep.mean():.0%}")
     return {k: v[keep] for k, v in g.items()}
+
+
+def gs_render_views(g, viewmats, Ks, Wt, Ht):
+    """逐一渲染每個拍攝角度：回傳 (RGB 0~1, 期望深度, 不透明度)，單位與 3DGS 座標相同（公分）"""
+    import torch
+    from gsplat import rasterization
+    dev = "cuda"
+    T = {k: torch.tensor(v, dtype=torch.float32, device=dev) for k, v in g.items()}
+    means, quats, scales = T["means"], T["quats"], torch.exp(T["scales"])
+    op, cols = torch.sigmoid(T["opacities"]), torch.cat([T["sh0"], T["shN"]], 1)
+    with torch.no_grad():
+        for V, K in zip(viewmats, Ks):
+            rc, ra, _ = rasterization(means=means, quats=quats, scales=scales, opacities=op, colors=cols,
+                                      viewmats=torch.tensor(V, dtype=torch.float32, device=dev)[None],
+                                      Ks=torch.tensor(K, dtype=torch.float32, device=dev)[None],
+                                      width=Wt, height=Ht, sh_degree=3, packed=False, render_mode="RGB+ED")
+            yield (rc[0, ..., :3].clamp(0, 1).cpu().numpy(), rc[0, ..., 3].cpu().numpy(), ra[0, ..., 0].cpu().numpy())
+    del T
+    torch.cuda.empty_cache()
+
+
+def gs_surface(g, viewmats, Ks, masks, frame_paths, W0, H0, ds, lo, hi, out_dir, alpha_min=0.6):
+    """用訓練好的 3DGS 決定形狀：每個角度渲染深度，只取「物體遮罩內且夠不透明」的像素，用 TSDF 融合成表面。
+    3DGS 的位置經過幾千輪「從各角度看都要像照片」的修正，比 VGGT 一次估計的深度準。
+    同時把渲染出的彩色影像存檔（物體以外保留原照片），之後網格取色用（各角度一致，不會拼接出色塊）。
+    回傳：表面點、顏色、來源點（給法向量定向）、來源影格（g 的 viewmats 序號）、格子大小、渲染影像路徑"""
+    Wt, Ht = int(round(W0 * ds)), int(round(H0 * ds))
+    size = float((hi - lo).max()); center = (lo + hi) / 2
+    length = size * 1.3
+    res = int(np.clip(length / (size / 300), 128, max(TSDF_MAX_RES, 384)))
+    vox = length / res
+    trunc = 3.0 * vox
+    vol = o3d.pipelines.integration.UniformTSDFVolume(
+        length=length, resolution=res, sdf_trunc=trunc,
+        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
+        origin=(center - length / 2).reshape(3, 1))
+    os.makedirs(out_dir, exist_ok=True)
+    k3 = np.ones((3, 3), np.uint8)
+    srcP, srcF, paths = [], [], []
+    rng = np.random.default_rng(2)
+    for k, ((rgb, dep, al), V, K, mk, fp) in enumerate(zip(gs_render_views(g, viewmats, Ks, Wt, Ht), viewmats, Ks, masks, frame_paths)):
+        orig = np.asarray(Image.open(fp).convert("RGB").resize((Wt, Ht)), np.float32) / 255
+        comp = np.clip(rgb + (1 - al[..., None]) * orig, 0, 1)            # 物體用 3DGS 渲染色，其他保留原照片
+        im = Image.fromarray((comp * 255).astype(np.uint8))
+        if (Wt, Ht) != (W0, H0):
+            im = im.resize((W0, H0), Image.BICUBIC)
+        q = f"{out_dir}/{k:03d}.jpg"; im.save(q, quality=95); paths.append(q)
+        m = cv2.resize(cv2.erode(mk.astype(np.uint8), k3, iterations=2), (Wt, Ht), interpolation=cv2.INTER_NEAREST) > 0
+        ok = m & (al > alpha_min) & (dep > 1e-6)
+        d = np.where(ok, dep, 0).astype(np.float32)                         # RGB+ED：已是「期望深度」（除過不透明度）
+        col8 = np.ascontiguousarray((np.clip(rgb / np.maximum(al[..., None], 1e-3), 0, 1) * 255).astype(np.uint8))
+        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            o3d.geometry.Image(col8),
+            o3d.geometry.Image(np.ascontiguousarray(d)), depth_scale=1.0, depth_trunc=1e6, convert_rgb_to_intensity=False)
+        vol.integrate(rgbd, o3d.camera.PinholeCameraIntrinsic(Wt, Ht, float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])),
+                      np.asarray(V, np.float64))
+        vv, uu = np.nonzero(ok)
+        if len(vv):
+            sel = rng.choice(len(vv), min(len(vv), 4000), replace=False)
+            z = d[vv[sel], uu[sel]].astype(np.float64)
+            Xc = np.stack([(uu[sel] - K[0, 2]) * z / K[0, 0], (vv[sel] - K[1, 2]) * z / K[1, 1], z], 1)
+            srcP.append((Xc - V[:3, 3]) @ V[:3, :3]); srcF.append(np.full(len(sel), k))
+    pc = vol.extract_point_cloud()
+    P, C = np.asarray(pc.points), np.asarray(pc.colors)
+    del vol
+    return P, C, (np.concatenate(srcP) if srcP else np.zeros((0, 3))), \
+        (np.concatenate(srcF) if srcF else np.zeros(0, int)), vox, paths
 
 
 def export_gaussians(g, max_n, ply_path, splat_path):
@@ -1649,11 +1732,83 @@ def main():
     except Exception as e:
         log("相機診斷圖失敗：", e)
 
+    # ---- 5G. 3DGS（選用）：先訓練擬真模型，再用它決定網格形狀 ----
+    gs_info = {}
+    color_paths = list(frame_paths)                       # 網格取色用的影像（3DGS 成功時換成渲染圖）
+    above = Pc_b[:, 2] > 0.05 * U
+    def _ext(P):
+        P = P[P[:, 2] > 0.05 * U]
+        e = np.percentile(P, 99, 0) - np.percentile(P, 1, 0)
+        return [round(float(e[0]), 1), round(float(e[1]), 1), round(float(np.percentile(P[:, 2], 99.5)), 1)]
+    size_vggt = _ext(Pc_b) if above.sum() > 100 else None
+    if USE_GS and above.sum() > 1000:
+        try:
+            try:
+                import gsplat  # noqa
+            except ImportError:
+                sh("pip -q install ninja gsplat")
+            import gsplat
+            log("gsplat", gsplat.__version__, "（第一次執行會編譯 CUDA 程式，約 5~10 分鐘）")
+            ok_ids = [i for i in range(len(frame_paths)) if MASKS[i].any() and frame_ok[i]]
+            b0 = to_al(np.zeros((1, 3)))[0]
+            Alin = np.stack([to_al(np.eye(3)[k:k + 1])[0] - b0 for k in range(3)], 1)   # 轉正座標 = Alin·X + b0
+            c_ = float(np.cbrt(np.linalg.det(Alin))); Rot = Alin / c_
+            ds = min(1.0, GS_RES / max(W0, H0))
+            VMs, KSs = [], []
+            for i in ok_ids:
+                Rv = extrinsic[i][:, :3].astype(np.float64); tv = extrinsic[i][:, 3].astype(np.float64)
+                V4 = np.eye(4); V4[:3, :3] = Rv @ Rot.T; V4[:3, 3] = c_ * tv - Rv @ Rot.T @ b0
+                Ki = intrinsic[i].astype(np.float64)
+                cxo = (Ki[0, 2] - padL + 0.5) / sx - 0.5; cyo = (Ki[1, 2] - padT + 0.5) / sy - 0.5
+                KSs.append(np.array([[Ki[0, 0] / sx * ds, 0, (cxo + 0.5) * ds - 0.5], [0, Ki[1, 1] / sy * ds, (cyo + 0.5) * ds - 0.5], [0, 0, 1]]))
+                VMs.append(V4)
+            # 初始點：VGGT 的物體點雲（不再經過 VGGT 網格）
+            ia = np.nonzero(above)[0]
+            ia = np.random.default_rng(0).choice(ia, min(len(ia), 200_000), replace=False)
+            P0, C0 = Pc_b[ia], np.clip(COL_obj[ia], 0, 1)
+            msk_ok = [MASKS[i] for i in ok_ids]
+            log(f"3DGS 訓練：{len(ok_ids)} 張影像（{int(W0 * ds)}×{int(H0 * ds)}），{GS_ITERS} 步，初始 {len(P0):,} 點")
+            g = train_3dgs([frame_paths[i] for i in ok_ids], msk_ok, VMs, KSs, W0, H0, ds, P0, C0, GS_ITERS)
+            surf, surf_tol = None, 0.0
+            if GS_MESH:
+                try:
+                    lo_, hi_ = np.percentile(Pc_b[above], 0.5, 0), np.percentile(Pc_b[above], 99.5, 0)
+                    pad_ = 0.15 * (hi_ - lo_).max()
+                    Pg_, Cg_, sP_, sF_, vox_g, rpaths = gs_surface(g, VMs, KSs, msk_ok, [frame_paths[i] for i in ok_ids],
+                                                                  W0, H0, ds, lo_ - pad_, hi_ + pad_, f"{TMP}/gsr")
+                    log(f"3DGS 表面融合：{len(Pg_):,} 點（格子 {vox_g * 10:.2f} mm）")
+                    if len(Pg_) > 5000:
+                        Pc_b, COL_obj, FID_obj = Pg_, np.clip(Cg_, 0, 1), np.zeros(len(Pg_), int)
+                        Pc_src, src_F = sP_, np.asarray(ok_ids)[sF_]
+                        for k, i in enumerate(ok_ids):
+                            color_paths[i] = rpaths[k]
+                        surf, surf_tol = cKDTree(Pg_), 2.5 * vox_g
+                        gs_info["mesh_source"] = "3dgs"
+                    else:
+                        WARN.append("3DGS 表面點太少，網格改用 VGGT 深度")
+                except Exception as e:
+                    traceback.print_exc()
+                    WARN.append(f"3DGS 表面融合失敗，網格改用 VGGT 深度（{str(e)[:80]}）")
+            if GS_CLEAN:
+                g = clean_gaussians(g, VMs, KSs, msk_ok, W0, H0, ds, GS_MIN_OPACITY, surf=surf, surf_tol=surf_tol)
+            n_out = export_gaussians(g, GS_MAX, f"{WORK}/gaussians.ply", f"{WORK}/model.splat")
+            gs_info.update(gs=True, gs_count=int(n_out), gs_mb=round(os.path.getsize(f"{WORK}/model.splat") / 1e6, 1))
+            log(f"3DGS 完成：{n_out:,} 個元素，model.splat {gs_info['gs_mb']} MB")
+            del g
+        except Exception as e:
+            traceback.print_exc()
+            WARN.append(f"3DGS 失敗（網格模型仍可使用）：{str(e)[:120]}")
+            gs_info["gs"] = False
+    gs_info.setdefault("mesh_source", "vggt")
+    if size_vggt:
+        gs_info["size_vggt_cm"] = size_vggt
+    log(f"網格形狀來源：{gs_info['mesh_source']}")
+
     # ---- 6. 網格 ----
     mesh, bp, info, vox = build_mesh(Pc_b, COL_obj, FID_obj, Pc_g, COL_bg, Cc, U, has_table, Pc_src, src_F)
     is_obj = np.asarray(mesh.vertices)[:, 2] > 1.5 * vox
     cols = np.asarray(mesh.vertex_colors).copy()
-    cols[is_obj] = color_from_frames(mesh, np.nonzero(is_obj)[0], frame_paths, MASKS, intrinsic, Rcam, A,
+    cols[is_obj] = color_from_frames(mesh, np.nonzero(is_obj)[0], color_paths, MASKS, intrinsic, Rcam, A,
                                      Cc, sx, sy, padL, padT, sc[pick], cols[is_obj])
     mesh.vertex_colors = o3d.utility.Vector3dVector(np.clip(cols, 0, 1))
     log("頂點上色完成")
@@ -1675,7 +1830,7 @@ def main():
             ob = P[:, 2] > 1.5 * vox
             if ob.any():
                 fb = np.asarray(mesh.vertex_colors)[cKDTree(np.asarray(mesh.vertices)).query(P[ob], k=1)[1]]
-                out[ob], _ = project_colors(P[ob], Nn[ob], mesh, frame_paths, MASKS, intrinsic, Rcam, A,
+                out[ob], _ = project_colors(P[ob], Nn[ob], mesh, color_paths, MASKS, intrinsic, Rcam, A,
                                             Cc, sx, sy, padL, padT, sc[pick], fb)
             top = ~ob & (P[:, 2] > -0.75 * vox)
             if tree_g is not None and top.any():
@@ -1694,46 +1849,6 @@ def main():
 
     # ---- 8. 匯出 ----
     export_all(mesh, tex_pack)
-    # ---- 9. 3DGS 擬真模型（選用）----
-    gs_info = {}
-    if USE_GS:
-        try:
-            try:
-                import gsplat  # noqa
-            except ImportError:
-                sh("pip -q install ninja gsplat")
-            import gsplat
-            log("gsplat", gsplat.__version__, "（第一次執行會編譯 CUDA 程式，約 5~10 分鐘）")
-            ok_ids = [i for i in range(len(frame_paths)) if MASKS[i].any()]
-            b0 = to_al(np.zeros((1, 3)))[0]
-            Alin = np.stack([to_al(np.eye(3)[k:k + 1])[0] - b0 for k in range(3)], 1)   # 轉正座標 = Alin·X + b0
-            c_ = float(np.cbrt(np.linalg.det(Alin))); Rot = Alin / c_
-            ds = min(1.0, GS_RES / max(W0, H0))
-            VMs, KSs = [], []
-            for i in ok_ids:
-                Rv = extrinsic[i][:, :3].astype(np.float64); tv = extrinsic[i][:, 3].astype(np.float64)
-                V4 = np.eye(4); V4[:3, :3] = Rv @ Rot.T; V4[:3, 3] = c_ * tv - Rv @ Rot.T @ b0
-                Ki = intrinsic[i].astype(np.float64)
-                cxo = (Ki[0, 2] - padL + 0.5) / sx - 0.5; cyo = (Ki[1, 2] - padT + 0.5) / sy - 0.5
-                KSs.append(np.array([[Ki[0, 0] / sx * ds, 0, (cxo + 0.5) * ds - 0.5], [0, Ki[1, 1] / sy * ds, (cyo + 0.5) * ds - 0.5], [0, 0, 1]]))
-                VMs.append(V4)
-            # 初始點：網格上物體部分的表面取樣（含顏色）
-            obj_m = o3d.geometry.TriangleMesh(mesh)
-            Vm = np.asarray(obj_m.vertices); Fm = np.asarray(obj_m.triangles)
-            obj_m.remove_triangles_by_mask((Vm[Fm][:, :, 2] <= 1.5 * vox).all(1)); obj_m.remove_unreferenced_vertices()
-            spc = obj_m.sample_points_uniformly(200_000)
-            P0, C0 = np.asarray(spc.points), np.clip(np.asarray(spc.colors), 0, 1)
-            log(f"3DGS 訓練：{len(ok_ids)} 張影像（{int(W0 * ds)}×{int(H0 * ds)}），{GS_ITERS} 步，初始 {len(P0):,} 點")
-            g = train_3dgs([frame_paths[i] for i in ok_ids], [MASKS[i] for i in ok_ids], VMs, KSs, W0, H0, ds, P0, C0, GS_ITERS)
-            if GS_CLEAN:
-                g = clean_gaussians(g, VMs, KSs, [MASKS[i] for i in ok_ids], W0, H0, ds, GS_MIN_OPACITY)
-            n_out = export_gaussians(g, GS_MAX, f"{WORK}/gaussians.ply", f"{WORK}/model.splat")
-            gs_info = dict(gs=True, gs_count=int(n_out), gs_mb=round(os.path.getsize(f"{WORK}/model.splat") / 1e6, 1))
-            log(f"3DGS 完成：{n_out:,} 個元素，model.splat {gs_info['gs_mb']} MB")
-        except Exception as e:
-            traceback.print_exc()
-            WARN.append(f"3DGS 失敗（網格模型仍可使用）：{str(e)[:120]}")
-            gs_info = dict(gs=False)
 
     info.update(tsdf=tsdf_used, textured=tex_pack is not None,
                 params_used=PARAMS_USED,

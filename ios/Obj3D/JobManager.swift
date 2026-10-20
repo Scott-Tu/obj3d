@@ -33,6 +33,8 @@ struct ResultMeta: Codable {
     let ruler_vs_arkit: Double?
     let use_arkit: Bool?
     let smooth_level: String?
+    let mesh_source: String?
+    let size_vggt_cm: [Double]?
 }
 
 struct JobResult {
@@ -385,6 +387,13 @@ final class JobManager: ObservableObject {
         var lines: [String] = []
         if let s = r.meta.size_cm, s.count == 3, r.meta.scale_source != "none" {
             lines.append(String(format: "尺寸：寬 %.1f × 深 %.1f × 高 %.1f cm", s[0], s[1], s[2]))
+        }
+        if let src = r.meta.mesh_source {
+            var t = "網格形狀：" + (src == "3dgs" ? "由 3DGS 決定" : "VGGT 深度")
+            if src == "3dgs", let v = r.meta.size_vggt_cm, v.count == 3, r.meta.scale_source != "none" {
+                t += String(format: "（對照：VGGT 點雲 %.1f × %.1f × %.1f cm）", v[0], v[1], v[2])
+            }
+            lines.append(t)
         }
         lines.append(r.meta.watertight == true ? "封閉無破孔 ✅" : "⚠️ 模型未完全封閉")
         if let t = r.meta.target_method {
